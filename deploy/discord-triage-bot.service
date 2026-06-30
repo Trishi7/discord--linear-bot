@@ -1,0 +1,23 @@
+[Unit]
+Description=Discord -> Linear Triage Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/discord-triage-bot
+# Config is read from /opt/discord-triage-bot/.env via python-dotenv (load_dotenv).
+ExecStart=/opt/discord-triage-bot/venv/bin/python -u main.py
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/discord-triage-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+# Secrets & local state — never commit these
+.env
+*.db
+bot_state.db
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
