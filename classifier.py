@@ -95,43 +95,90 @@ Confidence guidance:
 """
 
 
-QUERY_SYSTEM_PROMPT = """You parse Discord questions about Linear issues for the
-NFThing / membrane engineering team into structured filters. You ONLY parse —
-you never fetch, create, or modify anything.
+QUERY_SYSTEM_PROMPT = """You parse Discord questions for the NFThing / membrane
+engineering team into structured filters. You ONLY parse — you never fetch,
+create, or modify anything.
+
+There are TWO kinds of question:
+- person_activity: "what is <person> working on / up to / handling these days",
+  "what's <person> been doing" — a status check on ONE teammate. This blends the
+  person's Linear assignments with their recent Discord activity.
+- issue_list: anything about the team's Linear ISSUES — lists, filters, searches,
+  or a single issue lookup. E.g. "list my open bugs", "issues Sid raised in the
+  last 2 weeks", "what's open with the Bug label", "status of NFT-123".
 
 Output STRICT JSON only (no preamble, no fences) with this schema:
 {
   "is_query":     true | false,
-  "intent":       "lookup" | "list" | "none",
-  "identifier":   string,            // e.g. "NFT-123"; "" if not referenced
-  "search_term":  string,            // free-text keywords for fuzzy title search; "" if not applicable
-  "reporter":     string,            // "me" if the asker references themselves; a display name otherwise; "" if no reporter filter
+  "intent":       "person_activity" | "issue_list" | "none",
+  "person":       string,            // person_activity: the teammate's name; "" otherwise
+  "identifier":   string,            // issue_list: e.g. "NFT-123"; "" if not referenced
+  "search_term":  string,            // issue_list: free-text keywords for fuzzy title search; "" if n/a
+  "reporter":     string,            // issue_list: "me" if the asker references themselves; a name otherwise; "" if none
   "labels":       array of strings,  // subset of ["Bug","Feature","Improvement","BE","FE","UI"]; [] if not specified
-  "state_filter": "open" | "closed" | "in_progress" | "done" | "cancelled" | "any",
-  "days_back":    integer            // 0 = no time window
+  "states":       array of strings,  // subset of ["open","closed","in_progress","done","cancelled"]; [] = any state
+  "window_days":  integer            // 0 = no time window
 }
 
 Rules:
-- is_query=true ONLY if the message is asking about Linear issues. Greetings,
-  bug reports, off-topic chat, anything that's not a question about the team's
-  issues → is_query=false, intent="none".
-- intent="lookup" when a specific identifier is referenced (e.g. "status of NFT-123",
-  "show me NFT-123"). Set `identifier`; leave other filter fields at defaults.
-- intent="list" for everything else (lists, filters, searches).
-- "I" / "my" / "me" → reporter="me". A named person → reporter="<Name>" (preserve casing).
-- Time phrases → days_back: "today"=1, "this week"=7, "last 2 weeks"=14, "this month"=30,
-  no time reference → 0.
-- State phrases → state_filter:
-    "open" / "still open" / "not done"               → "open"
-    "closed" / "done" / "finished" / "completed"     → "done"
-    "cancelled" / "wontfix"                          → "cancelled"
-    "in progress" / "WIP" / "being worked on"        → "in_progress"
-    none mentioned                                   → "any"
+- is_query=true ONLY if the message is a person_activity or issue_list question.
+  Greetings, bug reports, off-topic chat → is_query=false, intent="none".
+- intent="person_activity" when the question asks what a specific PERSON is working
+  on / up to / handling / has been doing. Set `person` to that name (preserve
+  casing); leave issue-filter fields (identifier/search_term/reporter) at "".
+  "what am I working on" / "what's on my plate" → person="me".
+- intent="issue_list" for everything else about issues (lists, filters, searches,
+  single-issue lookups). Set `identifier` for a specific key (e.g. "status of
+  NFT-123") and leave other filter fields at defaults; otherwise use
+  reporter/labels/states/window_days/search_term as applicable. Leave `person`="".
+- "I" / "my" / "me" → reporter="me" (issue_list). A named person → reporter="<Name>".
+- Time phrases → window_days: "today"=1, "this week"=7, "last 2 weeks"=14,
+  "this month"=30, no time reference → 0.
+- State phrases → states (may be several):
+    "open" / "still open" / "not done"               → ["open"]
+    "closed" / "done" / "finished" / "completed"     → ["done"]
+    "cancelled" / "wontfix"                          → ["cancelled"]
+    "in progress" / "WIP" / "being worked on"        → ["in_progress"]
+    none mentioned                                   → []
 - labels: only "Bug" / "Feature" / "Improvement" / "BE" / "FE" / "UI" are valid.
   Map "frontend"→"FE", "backend"→"BE", "ui"/"UX"→"UI". Drop anything else.
-- search_term: any free-text keywords from the question that aren't covered by the
-  other fields. "" if not applicable.
+- search_term: any free-text keywords from the question not covered by other
+  fields. "" if not applicable.
 - Don't invent details. Default fields rather than guess.
+"""
+
+
+PERSON_ACTIVITY_SYNTHESIS_PROMPT = """You write a SHORT status summary of what one
+teammate is working on, for the NFThing / membrane engineering team, as a Discord
+reply.
+
+You are given two data sources that were ALREADY gathered for you: the person's
+active/assigned Linear issues, and their recent Discord messages from monitored
+channels. You ONLY summarise what is in that data. You never fetch anything, and
+you must NOT invent issues, identifiers, links, statuses, or activity.
+
+Write GitHub-flavoured markdown in exactly this shape:
+
+**<Person> — what they're working on**
+
+**Working on (Linear):**
+- One bullet per issue: `IDENTIFIER` — <title> — _<status>_ — <url>
+- If there are no Linear issues, write exactly: _nothing in Linear_
+
+**Recent Discord activity (last N days):**
+- A 1–3 sentence natural-language summary of what they've been posting (deploys,
+  blockers, questions, PRs, decisions). Weave in jump links to the 1–3 most
+  relevant messages inline, e.g. "shipped the payout fix ([msg](<jump_url>))".
+- Do NOT dump raw message logs. Summarise.
+- If there are no Discord messages, write exactly: _nothing in Discord_
+
+Hard rules:
+- Use ONLY identifiers, titles, statuses, and URLs present in the Linear data.
+  Never fabricate a link or an issue.
+- Use ONLY jump_url values present in the Discord data. Never invent a link.
+- Keep it tight — a chat reply, not a report. Stay well under 1500 characters.
+- If a coverage note is provided in the data, add it as a short final italic line.
+- Output the reply text only — no preamble, no code fences.
 """
 
 
@@ -365,9 +412,10 @@ class Classifier:
 
         is_query = bool(parsed.get("is_query", False))
         intent = parsed.get("intent", "none")
-        if intent not in {"lookup", "list", "none"}:
+        if intent not in {"person_activity", "issue_list", "none"}:
             intent = "none"
 
+        person = str(parsed.get("person") or "").strip()
         identifier = str(parsed.get("identifier") or "").strip()
         search_term = str(parsed.get("search_term") or "").strip()
         reporter = str(parsed.get("reporter") or "").strip()
@@ -381,27 +429,120 @@ class Classifier:
             if isinstance(lab, str) and lab in allowed and lab not in labels:
                 labels.append(lab)
 
-        state_filter = parsed.get("state_filter", "any")
-        if state_filter not in {
-            "open", "closed", "in_progress", "done", "cancelled", "any",
-        }:
-            state_filter = "any"
+        raw_states = parsed.get("states") or []
+        if not isinstance(raw_states, list):
+            raw_states = []
+        allowed_states = {"open", "closed", "in_progress", "done", "cancelled"}
+        states: list[str] = []
+        for s in raw_states:
+            if isinstance(s, str) and s in allowed_states and s not in states:
+                states.append(s)
 
         try:
-            days_back = int(parsed.get("days_back", 0))
+            window_days = int(parsed.get("window_days", 0))
         except (TypeError, ValueError):
-            days_back = 0
-        days_back = max(0, days_back)
+            window_days = 0
+        window_days = max(0, window_days)
 
         normalised = {
             "is_query": is_query,
             "intent": intent,
+            "person": person,
             "identifier": identifier,
             "search_term": search_term,
             "reporter": reporter,
             "labels": labels,
-            "state_filter": state_filter,
-            "days_back": days_back,
+            "states": states,
+            "window_days": window_days,
         }
         log.info("[parse_query] DONE: %s", normalised)
         return normalised
+
+    async def summarize_person_activity(
+        self,
+        *,
+        person: str,
+        window_days: int,
+        linear_issues: list[dict],
+        discord_messages: list[dict],
+        coverage_note: str = "",
+    ) -> Optional[str]:
+        """Synthesise ONE concise reply describing what `person` is working on,
+        from the Linear + Discord data already gathered. Read-only — summarises
+        only; never fetches or invents. Returns the reply text, or None on any
+        API/parse failure so the caller can fall back to a deterministic render.
+        """
+        log.info(
+            "[summarize] step 1/3: person=%r window=%d linear=%d discord=%d",
+            person,
+            window_days,
+            len(linear_issues or []),
+            len(discord_messages or []),
+        )
+
+        # Compact, bounded payload so the model can't be flooded with raw logs.
+        slim_issues = [
+            {
+                "identifier": i.get("identifier"),
+                "title": i.get("title"),
+                "status": i.get("state_name") or i.get("state"),
+                "url": i.get("url"),
+                "updatedAt": i.get("updatedAt") or i.get("updated_at"),
+                "priority": i.get("priority"),
+            }
+            for i in (linear_issues or [])[:25]
+        ]
+        slim_msgs = []
+        for m in (discord_messages or [])[:30]:
+            text = (m.get("text") or "").strip()
+            if len(text) > 300:
+                text = text[:297] + "…"
+            ts = m.get("timestamp")
+            slim_msgs.append(
+                {
+                    "channel": m.get("channel"),
+                    "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                    "text": text,
+                    "jump_url": m.get("jump_url"),
+                    "attachments": len(m.get("attachment_urls") or []),
+                }
+            )
+
+        payload = {
+            "person": person,
+            "window_days": window_days,
+            "linear_issues": slim_issues,
+            "discord_messages": slim_msgs,
+            "coverage_note": coverage_note,
+        }
+        user_prompt = (
+            "Summarise this teammate's current work from the data below. Remember: "
+            "summarise only, invent nothing, and use only the links present here.\n\n"
+            f"```json\n{json.dumps(payload, default=str, ensure_ascii=False)}\n```"
+        )
+
+        log.info("[summarize] step 2/3: calling Anthropic model=%s", self._model)
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=700,
+                system=PERSON_ACTIVITY_SYNTHESIS_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except Exception:
+            log.exception("[summarize] Anthropic call raised; returning None")
+            return None
+
+        text_blocks = [
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ]
+        if not text_blocks:
+            log.warning("[summarize] no text blocks in response; returning None")
+            return None
+
+        reply = "\n".join(text_blocks).strip()
+        # Strip an accidental wrapping code fence if the model added one.
+        reply = _JSON_FENCE.sub("", reply).strip()
+        log.info("[summarize] step 3/3: DONE len=%d", len(reply))
+        return reply or None

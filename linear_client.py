@@ -144,6 +144,37 @@ query ListIssues($filter: IssueFilter!, $first: Int!) {
 """
 
 
+_ASSIGNED_ISSUES = """
+query AssignedIssues($filter: IssueFilter!, $first: Int!) {
+  issues(filter: $filter, first: $first, orderBy: updatedAt) {
+    nodes {
+      identifier
+      title
+      url
+      updatedAt
+      priority
+      state { name type }
+    }
+  }
+}
+"""
+
+
+def _assigned_node_to_dict(node: dict) -> dict:
+    """Slim projection used by `active_issues_for_user` — just the fields a
+    person-activity reply needs."""
+    state = node.get("state") or {}
+    return {
+        "identifier": node.get("identifier"),
+        "title": node.get("title"),
+        "state_name": state.get("name"),
+        "state_type": state.get("type"),
+        "url": node.get("url"),
+        "updatedAt": node.get("updatedAt"),
+        "priority": node.get("priority"),
+    }
+
+
 def _issue_node_to_dict(node: dict) -> dict:
     """Normalise an Issue GraphQL node into the dict shape callers expect."""
     labels = [
@@ -267,6 +298,32 @@ class LinearClient:
             self._members_loaded = True
             log.info("[linear._get_team_members] cached %d members", len(self._members))
         return self._members
+
+    async def list_team_members(self) -> list[dict]:
+        """Public read-only roster of the configured team as
+        [{id, name, displayName, email}].
+
+        Wraps the same cached fetch `resolve_assignee` uses. Returns [] on any
+        error — never raises (query-mode convention, like `list_issues`).
+        """
+        log.info("[linear.list_team_members] step 1/2: team %s", self._team_id)
+        try:
+            members = await self._get_team_members()
+        except Exception:
+            log.exception("[linear.list_team_members] failed; returning []")
+            return []
+        out = [
+            {
+                "id": m.get("id"),
+                "name": m.get("name"),
+                "displayName": m.get("displayName"),
+                "email": m.get("email"),
+            }
+            for m in members
+            if m.get("id")
+        ]
+        log.info("[linear.list_team_members] step 2/2: %d members", len(out))
+        return out
 
     # -- resolvers -----------------------------------------------------------
 
@@ -596,6 +653,70 @@ class LinearClient:
         results = [_issue_node_to_dict(n) for n in nodes if n]
         log.info("[linear.list_issues] step 2/2: %d results", len(results))
         return results
+
+    async def active_issues_for_user(
+        self,
+        user_id: str,
+        updated_after: Optional[str] = None,
+        *,
+        limit: int = 25,
+    ) -> list[dict]:
+        """Issues ASSIGNED to `user_id` on this team that are EITHER in a
+        "started"-type workflow state OR were updated since `updated_after`
+        (ISO-8601). The two conditions are OR-ed; pass `updated_after=None` to
+        fall back to "started"-only.
+
+        Returns {identifier, title, state_name, state_type, url, updatedAt,
+        priority} dicts, newest-updated first. Returns [] on any error or when
+        `user_id` is empty. Read-only, never raises."""
+        log.info(
+            "[linear.active_issues_for_user] step 1/2: user=%s updated_after=%s limit=%d",
+            user_id, updated_after, limit,
+        )
+        if not user_id:
+            return []
+
+        or_clauses: list[dict] = [{"state": {"type": {"eq": "started"}}}]
+        if updated_after:
+            or_clauses.append({"updatedAt": {"gte": updated_after}})
+        f: dict = {
+            "team": {"id": {"eq": self._team_id}},
+            "assignee": {"id": {"eq": user_id}},
+            "or": or_clauses,
+        }
+        try:
+            data = await self._gql(_ASSIGNED_ISSUES, {"filter": f, "first": int(limit)})
+        except Exception:
+            log.exception("[linear.active_issues_for_user] failed; returning []")
+            return []
+        nodes = (data.get("issues") or {}).get("nodes") or []
+        results = [_assigned_node_to_dict(n) for n in nodes if n]
+        # Guarantee updatedAt-desc regardless of the API's orderBy direction.
+        results.sort(key=lambda r: r.get("updatedAt") or "", reverse=True)
+        log.info("[linear.active_issues_for_user] step 2/2: %d results", len(results))
+        return results
+
+    async def recent_issues_created_by(
+        self,
+        user_id: str,
+        created_after: Optional[str] = None,
+        *,
+        limit: int = 25,
+    ) -> list[dict]:
+        """Issues CREATED by `user_id` on this team, optionally since
+        `created_after` (ISO-8601). Thin wrapper over `list_issues`; same
+        normalised dict shape. Returns [] on error or empty `user_id`."""
+        log.info(
+            "[linear.recent_issues_created_by] user=%s created_after=%s limit=%d",
+            user_id, created_after, limit,
+        )
+        if not user_id:
+            return []
+        return await self.list_issues(
+            creator_id=user_id,
+            created_after=created_after,
+            limit=limit,
+        )
 
     async def search_issues(self, query: str) -> list[dict]:
         """Best-effort text search of the team's issues by title / key terms.

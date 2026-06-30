@@ -13,11 +13,13 @@ posted to the same channel instead.
 """
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import discord
 
 import config
+import query
 from classifier import Classifier
 from db import DB
 from linear_client import LinearClient, LinearError
@@ -53,15 +55,15 @@ _SIGNAL_HUMAN = {
 # Linear workflow state TYPEs we consider "open" for duplicate detection.
 _OPEN_STATE_TYPES = {"backlog", "unstarted", "started", "triage"}
 
-# Query-mode mapping from the classifier's coarse state_filter to the set of
-# Linear workflow state TYPEs to filter by. Empty list means "no state filter".
+# Query-mode mapping from a coarse state token (parsed `states[]`) to the set of
+# Linear workflow state TYPEs to filter by. Unioned across the requested tokens
+# by `_state_types_for`; an empty result means "no state filter".
 _QUERY_STATE_TYPES = {
     "open": ["backlog", "unstarted", "started", "triage"],
     "closed": ["completed", "canceled"],
     "in_progress": ["started"],
     "done": ["completed"],
     "cancelled": ["canceled"],
-    "any": [],
 }
 
 # Cap on how many issues we list in a single query-mode reply.
@@ -234,8 +236,8 @@ class TriageBot(discord.Client):
             if message.channel.id == config.APPROVAL_CHANNEL_ID:
                 await self._safe_reply(
                     message,
-                    "I only answer Linear questions here. Try `list my open bugs` "
-                    "or `status of NFT-123`.",
+                    "I only answer questions here. Try `what is Sid working on?`, "
+                    "`list my open bugs`, or `status of NFT-123`.",
                 )
                 return
 
@@ -1188,12 +1190,15 @@ class TriageBot(discord.Client):
             log.exception("[query] reply failed")
 
     async def _handle_query(self, message: discord.Message) -> bool:
-        """Handle an @-mention as a Linear question.
+        """Handle an @-mention as a question — either "what is <person> working
+        on?" (person_activity) or an issue list/lookup (issue_list).
 
         Returns True if the message was handled (replied to) as a query;
-        False if it didn't read like a Linear question and the report
-        pipeline should be given a chance instead. Read-only — calls
-        linear_client.get_issue / list_issues / search_issues only.
+        False if it didn't read like a question and the report pipeline should
+        be given a chance instead. READ-ONLY throughout — only reads from Linear
+        (get_issue / list_issues / search_issues / active_issues_for_user /
+        list_team_members) and Discord history; never creates, comments, or
+        modifies anything.
         """
         log.info(
             "[query] step 1/4: msg=%s author=%s(%s) channel=#%s",
@@ -1207,9 +1212,9 @@ class TriageBot(discord.Client):
         if not text:
             await self._safe_reply(
                 message,
-                "👋 Mention me with a Linear question — e.g. "
-                "`list my open bugs`, `what's open with the Bug label`, "
-                "or `status of NFT-123`.",
+                "👋 Mention me with a question — e.g. "
+                "`what is Sid working on?`, `list my open bugs`, "
+                "`what's open with the Bug label`, or `status of NFT-123`.",
             )
             log.info("[query] msg=%s empty after stripping mention; help reply", message.id)
             return True
@@ -1230,35 +1235,58 @@ class TriageBot(discord.Client):
             log.info("[query] LLM said not a Linear question; letting report path try")
             return False
 
-        log.info("[query] step 3/4: running query against Linear: %s", parsed)
-        try:
-            issues = await self._run_query(parsed, requester=message.author)
-        except Exception:
-            log.exception("[query] _run_query raised; replying with error")
-            await self._safe_reply(message, "⚠️ Sorry — Linear lookup failed. See bot logs.")
+        intent = parsed.get("intent")
+        log.info("[query] step 3/4: intent=%s parsed=%s", intent, parsed)
+
+        if intent == "person_activity":
+            await self._handle_person_activity(message, parsed)
+            log.info("[query] DONE msg=%s (person_activity)", message.id)
             return True
 
-        log.info("[query] step 4/4: replying with %d issue(s)", len(issues))
-        reply = self._format_query_reply(issues, parsed)
+        if intent == "issue_list":
+            await self._handle_issue_list(message, parsed)
+            log.info("[query] DONE msg=%s (issue_list)", message.id)
+            return True
+
+        # is_query=true but no actionable intent — treat as not-a-query so the
+        # report pipeline (in a monitored channel) can have a go.
+        log.info("[query] intent %r not actionable; letting report path try", intent)
+        return False
+
+    # -- query mode: issue_list (read-only) ------------------------------
+
+    async def _handle_issue_list(self, message: discord.Message, parsed: dict) -> None:
+        """Existing behaviour: reporter / date / label / state → issues, or a
+        single-identifier lookup. Read-only."""
+        log.info("[query.issue_list] step 4/4: running against Linear")
+        try:
+            issues, single = await self._run_issue_list_query(
+                parsed, requester=message.author
+            )
+        except Exception:
+            log.exception("[query.issue_list] raised; replying with error")
+            await self._safe_reply(message, "⚠️ Sorry — Linear lookup failed. See bot logs.")
+            return
+
+        if single:
+            reply = (
+                self._format_single_issue(issues[0])
+                if issues
+                else "_(no matching Linear issue)_"
+            )
+        else:
+            reply = self._format_issue_list(issues)
         await self._safe_reply(message, reply)
-        log.info("[query] DONE msg=%s", message.id)
-        return True
 
-    async def _run_query(
+    async def _run_issue_list_query(
         self, parsed: dict, *, requester: discord.User
-    ) -> list[dict]:
-        """Translate the parsed query into one of get_issue / list_issues /
-        search_issues. Read-only."""
-        intent = parsed.get("intent")
-        if intent == "lookup":
-            identifier = (parsed.get("identifier") or "").strip()
-            if not identifier:
-                return []
+    ) -> tuple[list[dict], bool]:
+        """Translate an issue_list query into get_issue / list_issues /
+        search_issues. Returns (issues, is_single_lookup). Read-only."""
+        identifier = (parsed.get("identifier") or "").strip()
+        if identifier:
             issue = await self.linear.get_issue(identifier)
-            return [issue] if issue else []
-
-        if intent != "list":
-            return []
+            return ([issue] if issue else []), True
 
         # Resolve "reporter" to a Linear user id (best-effort).
         creator_id: Optional[str] = None
@@ -1287,33 +1315,216 @@ class TriageBot(discord.Client):
                     "[query] reporter %r could not be mapped to a Linear user; returning empty",
                     rep,
                 )
-                return []
+                return [], False
 
         labels = parsed.get("labels") or []
-        state_types = _QUERY_STATE_TYPES.get(parsed.get("state_filter", "any"), [])
-
-        days_back = int(parsed.get("days_back", 0) or 0)
-        created_after: Optional[str] = None
-        if days_back > 0:
-            from datetime import datetime, timezone, timedelta
-
-            cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
-            created_after = cutoff.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
+        state_types = self._state_types_for(parsed.get("states") or [])
+        created_after = self._cutoff_iso(int(parsed.get("window_days", 0) or 0))
         search_term = (parsed.get("search_term") or "").strip()
 
         # Pure free-text and nothing else → use the cheaper text search.
         if search_term and not (creator_id or labels or state_types or created_after):
             hits = await self.linear.search_issues(search_term)
-            return [self._search_hit_to_issue(h) for h in hits[:QUERY_LIST_LIMIT]]
+            return [self._search_hit_to_issue(h) for h in hits[:QUERY_LIST_LIMIT]], False
 
-        return await self.linear.list_issues(
+        issues = await self.linear.list_issues(
             creator_id=creator_id,
             label_names=labels or None,
             state_types=state_types or None,
             created_after=created_after,
             limit=QUERY_LIST_LIMIT,
         )
+        return issues, False
+
+    @staticmethod
+    def _state_types_for(states: list[str]) -> list[str]:
+        """Union the coarse state tokens into Linear workflow state TYPEs.
+        Empty (or anything mapping to no types) means "no state filter"."""
+        out: list[str] = []
+        for s in states or []:
+            for t in _QUERY_STATE_TYPES.get(s, []):
+                if t not in out:
+                    out.append(t)
+        return out
+
+    @staticmethod
+    def _cutoff_iso(days: int) -> Optional[str]:
+        """ISO-8601 timestamp for `now - days`, or None when days <= 0."""
+        if days <= 0:
+            return None
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        return cutoff.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    # -- query mode: person_activity (read-only) -------------------------
+
+    async def _handle_person_activity(
+        self, message: discord.Message, parsed: dict
+    ) -> None:
+        """Combine a person's Linear assignments with their recent Discord
+        activity into one synthesised reply. Read-only throughout — never
+        creates, comments, or modifies anything."""
+        person = (parsed.get("person") or "").strip()
+        if person.lower() in ("", "me", "myself", "i"):
+            # "what am I working on" — resolve against the asker themselves.
+            person = _display(message.author)
+        log.info("[query.person] step 1/4: resolving %r", person)
+
+        try:
+            resolution = await query.resolve_person(
+                person, linear=self.linear, client=self
+            )
+        except Exception:
+            log.exception("[query.person] resolve_person raised; replying with error")
+            await self._safe_reply(message, "⚠️ Sorry — person lookup failed. See bot logs.")
+            return
+
+        if resolution.get("ambiguous"):
+            log.info("[query.person] ambiguous; asking for clarification")
+            await self._safe_reply(message, self._format_ambiguous(person, resolution))
+            return
+
+        linear_user = resolution.get("linear_user")
+        discord_user = resolution.get("discord_user")
+        if not linear_user and not discord_user:
+            log.info("[query.person] no match in either system")
+            await self._safe_reply(
+                message,
+                f'I couldn\'t find anyone called "{person}" in Linear or recent '
+                f"Discord activity. Try their exact Linear or Discord name.",
+            )
+            return
+
+        window_days = int(parsed.get("window_days", 0) or 0) or config.QUERY_DISCORD_LOOKBACK_DAYS
+        log.info(
+            "[query.person] step 2/4: linear=%s discord=%s window=%dd",
+            (linear_user or {}).get("displayName"),
+            (discord_user or {}).get("display_name"),
+            window_days,
+        )
+
+        # LINEAR side — active/assigned issues updated within the window.
+        linear_issues: list[dict] = []
+        if linear_user and linear_user.get("id"):
+            updated_after = self._cutoff_iso(window_days)
+            try:
+                linear_issues = await self.linear.active_issues_for_user(
+                    linear_user["id"], updated_after
+                )
+            except Exception:
+                log.exception("[query.person] active_issues_for_user raised; continuing")
+                linear_issues = []
+
+        # DISCORD side — recent posts in monitored channels (id preferred).
+        discord_messages: list[dict] = []
+        scan_id = (discord_user or {}).get("id")
+        scan_name = None if scan_id else (discord_user or {}).get("display_name") or person
+        try:
+            discord_messages = await query.scan_recent_messages(
+                self,
+                author_id=scan_id,
+                author_name=scan_name,
+                days=window_days,
+                max_per_channel=config.QUERY_MAX_MESSAGES_PER_CHANNEL,
+            )
+        except Exception:
+            log.exception("[query.person] scan_recent_messages raised; continuing")
+            discord_messages = []
+
+        log.info(
+            "[query.person] step 3/4: linear_issues=%d discord_messages=%d",
+            len(linear_issues),
+            len(discord_messages),
+        )
+
+        # SYNTHESIS — one concise reply combining both sources.
+        display = (
+            (linear_user or {}).get("displayName")
+            or (discord_user or {}).get("display_name")
+            or person
+        )
+        coverage_note = (
+            f"Discord: last {window_days} days, monitored channels only."
+        )
+        reply = None
+        try:
+            reply = await self.classifier.summarize_person_activity(
+                person=display,
+                window_days=window_days,
+                linear_issues=linear_issues,
+                discord_messages=discord_messages,
+                coverage_note=coverage_note,
+            )
+        except Exception:
+            log.exception("[query.person] summarize raised; using fallback render")
+
+        if not reply:
+            reply = self._fallback_person_activity(
+                display, window_days, linear_issues, discord_messages, coverage_note
+            )
+
+        log.info("[query.person] step 4/4: replying")
+        await self._safe_reply(message, reply)
+
+    def _format_ambiguous(self, person: str, resolution: dict) -> str:
+        """Clarification prompt listing the plausible matches — we do NOT guess."""
+        lines = [f'"{person}" is ambiguous — who do you mean?']
+        for c in resolution.get("candidates", [])[:8]:
+            if c.get("source") == "linear":
+                label = c.get("displayName") or c.get("name") or "?"
+                extra = f" ({c['email']})" if c.get("email") else ""
+                lines.append(f"• {label}{extra} — _Linear_")
+            else:
+                label = c.get("display_name") or c.get("name") or "?"
+                lines.append(f"• {label} — _Discord_")
+        lines.append("_Reply with the exact name and I'll look again._")
+        return "\n".join(lines)
+
+    def _fallback_person_activity(
+        self,
+        person: str,
+        window_days: int,
+        linear_issues: list[dict],
+        discord_messages: list[dict],
+        coverage_note: str,
+    ) -> str:
+        """Deterministic render used when the synthesis model call is
+        unavailable. Same shape as the model output; no summarisation, just
+        the facts we already hold — never invents anything."""
+        lines = [f"**{person} — what they're working on**", "", "**Working on (Linear):**"]
+        if linear_issues:
+            for i in linear_issues[:QUERY_LIST_LIMIT]:
+                ident = i.get("identifier") or "?"
+                title = (i.get("title") or "(untitled)").strip()
+                if len(title) > 80:
+                    title = title[:77] + "…"
+                status = i.get("state_name") or "?"
+                url = i.get("url") or ""
+                link = f"[{ident}]({url})" if url else ident
+                lines.append(f"• {link} — {title} — _{status}_")
+        else:
+            lines.append("_nothing in Linear_")
+
+        lines.append("")
+        lines.append(f"**Recent Discord activity (last {window_days} days):**")
+        if discord_messages:
+            for m in discord_messages[:5]:
+                ts = m.get("timestamp")
+                when = ts.strftime("%b %d") if hasattr(ts, "strftime") else ""
+                snippet = (m.get("text") or "").strip().replace("\n", " ")
+                if len(snippet) > 120:
+                    snippet = snippet[:117] + "…"
+                jump = m.get("jump_url") or ""
+                ref = f" ([msg]({jump}))" if jump else ""
+                chan = m.get("channel") or "?"
+                lines.append(f"• _{when}_ #{chan}: {snippet or '(no text)'}{ref}")
+            if len(discord_messages) > 5:
+                lines.append(f"_(+{len(discord_messages) - 5} more)_")
+        else:
+            lines.append("_nothing in Discord_")
+
+        lines.append("")
+        lines.append(f"_{coverage_note}_")
+        return "\n".join(lines)
 
     @staticmethod
     def _search_hit_to_issue(hit: dict) -> dict:
@@ -1332,12 +1543,9 @@ class TriageBot(discord.Client):
             "latest_comment": None,
         }
 
-    def _format_query_reply(self, issues: list[dict], parsed: dict) -> str:
+    def _format_issue_list(self, issues: list[dict]) -> str:
         if not issues:
             return "_(no matching Linear issues)_"
-
-        if parsed.get("intent") == "lookup":
-            return self._format_single_issue(issues[0])
 
         lines = [f"**{len(issues)}** matching issue(s):"]
         for issue in issues[:QUERY_LIST_LIMIT]:

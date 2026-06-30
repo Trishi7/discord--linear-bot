@@ -6,9 +6,15 @@ Linear: create a new issue, comment on an existing one (optionally with a
 status transition), or do nothing. Behind `REQUIRE_APPROVAL` the proposed
 action is gated on a ✅/❌ react in a private channel.
 
-Also exposes a **read-only QUERY MODE** when @-mentioned, for asking Linear
-questions ("status of NFT-123", "list my open bugs", "what's open with the Bug
-label") directly from Discord.
+Also exposes a **read-only QUERY MODE** when @-mentioned, with two intents:
+
+- **`issue_list`** — Linear issue questions ("status of NFT-123", "list my open
+  bugs", "what's open with the Bug label").
+- **`person_activity`** — "what is `<person>` working on?", which merges a
+  person's **assigned/active Linear issues** with their **recent Discord
+  activity** from monitored channels into one synthesised reply.
+
+Query mode **never writes to Linear** (no create / comment / status change).
 
 ## Why a human-in-the-loop step?
 
@@ -30,7 +36,12 @@ Discord ──▶ Pre-filter ──▶ LLM classifier ──▶ Plan ──▶ A
                                                       message→issue mapping)
 
             ┌─────────────────── QUERY MODE (read-only) ───────────────┐
-@mention ──▶ parse_query (LLM) ──▶ list_issues / get_issue / search ──▶ reply
+@mention ──▶ parse_query (LLM) ──┬─ issue_list ──▶ list/get/search ──▶ reply
+                                 │
+                                 └─ person_activity ──▶ resolve_person
+                                      ├─ Linear: active_issues_for_user
+                                      └─ Discord: scan_recent_messages
+                                            └─▶ LLM synthesis ──▶ reply
 ```
 
 ## Project layout
@@ -43,8 +54,9 @@ discord-linear-bot/
 ├── main.py             # entry point
 ├── config.py           # env loading + allowlist parsing
 ├── db.py               # SQLite state store
-├── classifier.py       # report classifier + query parser (both pure JSON)
+├── classifier.py       # report classifier + query parser + activity synthesiser
 ├── linear_client.py    # Linear GraphQL client (labels, states, members, issues, comments)
+├── query.py            # read-only person resolution + Discord activity scan
 └── bot.py              # Discord bot: on_message, on_raw_reaction_add, query mode
 ```
 
@@ -108,13 +120,14 @@ dropped at debug level only, to keep the terminal log readable.
 ## `DISCORD_LINEAR_MAP`
 
 JSON object mapping Discord user ID (string) → Linear user email **or** Linear
-user UUID. Used for assignee resolution.
+user UUID. It is the **cross-link between a person's Discord and Linear
+identities**, used in two places:
 
 ```env
 DISCORD_LINEAR_MAP={"123456789":"sid@nfthing.com","987654321":"harsh@nfthing.com"}
 ```
 
-Resolution order for `mentioned_assignees[0]`:
+**1. Report-path assignee resolution** for `mentioned_assignees[0]`:
 
 1. If the mentioned person's Discord ID is in the map → resolve their Linear
    email/id against the team's members → use that user id.
@@ -122,6 +135,14 @@ Resolution order for `mentioned_assignees[0]`:
    member `displayName` / `name`.
 3. If neither matches → unassigned, with `_Intended assignee: @<name>_` noted
    in the issue description.
+
+**2. Query-mode `person_activity` cross-linking** (`query.resolve_person`):
+once a free-text name is matched to a **Linear** user, if that user's email/UUID
+appears as a **value** in the map, the corresponding Discord ID (the key) is used
+as the **exact** Discord identity to scan. Without a map entry, the Discord side
+falls back to display-name matching against recent monitored-channel posters and
+guild members — so **mapping quality directly determines how reliably the two
+sides line up** for someone whose Discord and Linear names differ.
 
 Invalid JSON in `DISCORD_LINEAR_MAP` logs a warning and falls back to `{}` —
 it never crashes startup.
@@ -185,22 +206,76 @@ title only and shouldn't assume the issue's progress changed).
 ## Query mode (read-only)
 
 @-mention the bot in a monitored channel **or** the approval channel with a
-question:
+question. A **separate** LLM call (`classifier.parse_query`, strict JSON)
+classifies it into one of two intents:
+
+### `issue_list` — questions about Linear issues
 
 ```
 @TriageBot status of NFT-123
 @TriageBot list the issues I raised in the last 2 weeks and their statuses
 @TriageBot what's open with the Bug label
 @TriageBot any open BE bugs
-@TriageBot what did Sid report this week
 ```
 
-The question is parsed by a **separate** LLM call (`classifier.parse_query`,
-strict JSON) into a filter spec — reporter / time window / labels / state /
-free text — then fetched via `linear_client.get_issue` / `list_issues` /
-`search_issues` and replied to in the same channel.
+Parsed into a filter spec — reporter / time window (`window_days`) / labels /
+states / free text — then fetched via `linear_client.get_issue` / `list_issues`
+/ `search_issues` and replied to in the same channel.
 
-**Hard guarantees:**
+### `person_activity` — "what is `<person>` working on?"
+
+```
+@TriageBot what is Sid working on?
+@TriageBot what's Harsh been up to this week?
+@TriageBot what am I working on?
+```
+
+Flow (`bot._handle_person_activity`):
+
+1. **`query.resolve_person(name)`** maps the free-text name to **both** a Linear
+   user (matched against `list_team_members` by displayName / name / email, with
+   first-name / partial fallback) and a Discord user (via `DISCORD_LINEAR_MAP`
+   when the Linear user is mapped, else display-name match against recent posters
+   / guild members).
+   - **Ambiguous** (several plausible matches) → the bot replies asking which
+     person and does nothing else — it never guesses.
+   - **No match** in either system → it says so plainly.
+2. **Linear side** — `active_issues_for_user(linear_user.id, now − window)`:
+   issues assigned to them that are in a `started`-type state **or** were updated
+   within the window.
+3. **Discord side** — `scan_recent_messages(...)` walks `channel.history` across
+   monitored channels only, matching by Discord ID (preferred) or display name.
+4. **Synthesis** — both result sets are handed to `classifier.summarize_person_activity`,
+   which writes one concise reply: a **Working on (Linear)** list (identifier,
+   title, status, link) and a 1–3 sentence **Recent Discord activity** summary
+   with jump links. The model **summarises** Discord — it must not dump raw logs
+   or invent issues/links; an empty source is reported as "nothing in `<source>`".
+   If the synthesis call fails, a deterministic fallback render is used instead.
+
+The window defaults to `QUERY_DISCORD_LOOKBACK_DAYS` when the question gives no
+time frame.
+
+### Environment knobs (person_activity)
+
+| Variable                        | Default | Purpose                                                      |
+|---------------------------------|---------|--------------------------------------------------------------|
+| `QUERY_DISCORD_LOOKBACK_DAYS`   | `14`    | How far back to scan Discord for a person-activity query.     |
+| `QUERY_MAX_MESSAGES_PER_CHANNEL`| `400`   | Hard cap on messages scanned per monitored channel per query. |
+
+### Limitations
+
+- **Monitored channels only** — DMs, threads in other channels, and any channel
+  not in `MONITORED_CHANNEL_IDS` are invisible to the Discord scan.
+- **Lookback-bounded** — only the last `QUERY_DISCORD_LOOKBACK_DAYS` days are
+  scanned, capped at `QUERY_MAX_MESSAGES_PER_CHANNEL` messages per channel, so a
+  very chatty channel can be truncated. Replies note the coverage
+  ("last N days, monitored channels only").
+- **Name-matching quality depends on `DISCORD_LINEAR_MAP`** — without a map entry
+  linking a person's Discord ID to their Linear identity, the Discord side relies
+  on display-name matching, which is weaker when the two names diverge.
+- Channels the bot can't read are skipped (logged), not errored.
+
+### Hard guarantees (both intents)
 
 - Query mode is **read-only**. It never calls `create_issue`, `add_comment`,
   or `set_issue_status`.
@@ -210,20 +285,26 @@ free text — then fetched via `linear_client.get_issue` / `list_issues` /
 - Anyone in the channel can query (no reporter allowlist for queries).
 
 If the @-mention is in a monitored channel but the parser decides the message
-isn't a Linear question (`is_query=false`), the report path is given a
+isn't a question it can answer (`is_query=false`), the report path is given a
 chance instead. In the approval channel that fall-through replies politely
 with a help nudge instead of dropping silently.
 
 ## Architecture separation
 
-Three modules with clean roles:
+Clean module roles:
 
-- **`classifier.py`** — pure JSON producer. Two prompts (report classifier +
-  query parser), both `Anthropic`-backed. **Never** touches Linear.
+- **`classifier.py`** — `Anthropic`-backed text/JSON producer. Three prompts:
+  report classifier, query parser, and the `person_activity` synthesiser
+  (`summarize_person_activity`). **Never** touches Linear or Discord.
 - **`linear_client.py`** — all Linear reads/writes over GraphQL. No Linear MCP.
   Helpers: `resolve_label_ids`, `resolve_assignee`, `create_issue`,
   `add_comment`, `set_issue_status`, `list_team_states`, `search_issues`,
-  `get_issue`, `list_issues`.
+  `get_issue`, `list_issues`, plus the query-mode reads `list_team_members`,
+  `active_issues_for_user`, `recent_issues_created_by`.
+- **`query.py`** — read-only building blocks for `person_activity`:
+  `scan_recent_messages` (Discord history scan over monitored channels) and
+  `resolve_person` (free-text name → Linear user + Discord user). Takes the
+  Linear client and Discord client as parameters; never mutates either.
 - **`bot.py`** — orchestrates Discord events, decides plans, posts embeds,
   handles ✅/❌, runs query mode, persists state via `db.py`.
 
@@ -276,6 +357,8 @@ See `.env.example` for the full list with comments. Key knobs:
 | `ALLOWED_REPORTER_IDS`    | _(empty)_              | Numeric Discord user IDs allowed to report.                             |
 | `ALLOWED_REPORTER_NAMES`  | `Sid,Harsh,Trishi`     | Case-insensitive display-name fallback.                                 |
 | `DISCORD_LINEAR_MAP`      | `{}`                   | Discord user id → Linear email/UUID, JSON object.                       |
+| `QUERY_DISCORD_LOOKBACK_DAYS` | 14                 | Days back to scan Discord for a `person_activity` query.                |
+| `QUERY_MAX_MESSAGES_PER_CHANNEL` | 400             | Hard cap on messages scanned per monitored channel per query.           |
 
 ## Operational notes
 

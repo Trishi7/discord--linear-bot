@@ -93,6 +93,13 @@ MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "0.6"))
 CLASSIFY_DELAY_SECONDS = float(os.getenv("CLASSIFY_DELAY_SECONDS", "0"))
 DB_PATH = os.getenv("DB_PATH", "./bot_state.db")
 
+# Query mode — person-centric activity lookups ("what is Sid working on?").
+# How far back to scan Discord for a person-activity query.
+QUERY_DISCORD_LOOKBACK_DAYS = int(os.getenv("QUERY_DISCORD_LOOKBACK_DAYS", "14"))
+# Hard cap on messages scanned per monitored channel per query, to bound API
+# cost / latency.
+QUERY_MAX_MESSAGES_PER_CHANNEL = int(os.getenv("QUERY_MAX_MESSAGES_PER_CHANNEL", "400"))
+
 # If False, the bot creates Linear issues directly without the ✅/❌ approval step.
 REQUIRE_APPROVAL = _bool("REQUIRE_APPROVAL", default=True)
 
