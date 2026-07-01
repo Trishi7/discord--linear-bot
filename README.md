@@ -6,15 +6,29 @@ Linear: create a new issue, comment on an existing one (optionally with a
 status transition), or do nothing. Behind `REQUIRE_APPROVAL` the proposed
 action is gated on a ✅/❌ react in a private channel.
 
-Also exposes a **read-only QUERY MODE** when @-mentioned, with two intents:
+Also exposes a **read-only QUERY MODE** when @-mentioned, with three intents:
 
-- **`issue_list`** — Linear issue questions ("status of NFT-123", "list my open
-  bugs", "what's open with the Bug label").
+- **`issue_status`** — a status check on **one specific issue**, by key
+  ("status of NFT-123") or by fuzzy description ("what's the status of the DMs
+  issue", "where are we on the payout bug").
 - **`person_activity`** — "what is `<person>` working on?", which merges a
   person's **assigned/active Linear issues** with their **recent Discord
   activity** from monitored channels into one synthesised reply.
+- **`issue_list`** — questions about Linear issues as a **group** ("list my open
+  bugs", "what's open with the Bug label", "issues Sid raised last week").
 
-Query mode **never writes to Linear** (no create / comment / status change).
+Two cross-cutting behaviours:
+
+- **Source scoping** — a question can be scoped to **Discord only**, **Linear
+  only**, or **both**. "what did Harsh post on discord" hits only Discord; "what
+  is Harsh assigned in Linear" hits only Linear; an unscoped question uses both.
+  A source-scoped reply never carries a section for the other source.
+- **Edited messages re-trigger QUERY MODE only** — editing an @-mention question
+  re-runs the query on the new text and posts a fresh reply; editing an ordinary
+  message does nothing. Edits are **never** routed into the report/create path.
+
+Query mode (and edit-handling) is **strictly read-only** — no create / comment /
+status change, ever.
 
 ## Why a human-in-the-loop step?
 
@@ -36,12 +50,17 @@ Discord ──▶ Pre-filter ──▶ LLM classifier ──▶ Plan ──▶ A
                                                       message→issue mapping)
 
             ┌─────────────────── QUERY MODE (read-only) ───────────────┐
-@mention ──▶ parse_query (LLM) ──┬─ issue_list ──▶ list/get/search ──▶ reply
-                                 │
-                                 └─ person_activity ──▶ resolve_person
-                                      ├─ Linear: active_issues_for_user
-                                      └─ Discord: scan_recent_messages
-                                            └─▶ LLM synthesis ──▶ reply
+@mention  ──▶ parse_query (LLM) ──┬─ issue_status ──▶ get_issue (by key) or
+ or EDIT of    → intent + source  │                   find_issues_by_text (fuzzy)
+ an @mention     + subject/labels │                     ├─ 1 match  ──▶ reply
+                                  │                     ├─ 2–5      ──▶ ask which
+                                  │                     └─ 0        ──▶ honest miss
+                                  ├─ person_activity ──▶ resolve_person
+                                  │    (source: discord | linear | both)
+                                  │    ├─ Linear:  active_issues_for_user
+                                  │    └─ Discord: scan_recent_messages
+                                  │          └─▶ LLM synthesis ──▶ reply
+                                  └─ issue_list ──▶ list/get/search ──▶ reply
 ```
 
 ## Project layout
@@ -57,7 +76,7 @@ discord-linear-bot/
 ├── classifier.py       # report classifier + query parser + activity synthesiser
 ├── linear_client.py    # Linear GraphQL client (labels, states, members, issues, comments)
 ├── query.py            # read-only person resolution + Discord activity scan
-└── bot.py              # Discord bot: on_message, on_raw_reaction_add, query mode
+└── bot.py              # Discord bot: on_message, on_raw_message_edit, on_raw_reaction_add, query mode
 ```
 
 ## Categories & labels
@@ -207,7 +226,73 @@ title only and shouldn't assume the issue's progress changed).
 
 @-mention the bot in a monitored channel **or** the approval channel with a
 question. A **separate** LLM call (`classifier.parse_query`, strict JSON)
-classifies it into one of two intents:
+classifies it into one of three intents (`issue_status`, `person_activity`,
+`issue_list`) and also emits a **`source`** (`discord` | `linear` | `both`) plus
+an optional **category** (`labels`, e.g. `Bug`).
+
+### Source scoping (`discord` / `linear` / `both`)
+
+The parser infers *which system* a question is about, so a source-scoped reply
+only ever touches — and only ever shows — that source:
+
+| Phrasing cues                                             | `source`  | Effect |
+|----------------------------------------------------------|-----------|--------|
+| "on discord", "in the channel", "posted", "mentioned/said" | `discord` | Discord scan only; **no** Linear section |
+| "in linear", "assigned to", "ticket", "issue", "status of" | `linear`  | Linear lookup only; **no** Discord section |
+| no explicit source                                        | `both`    | combined (previous behaviour) |
+
+```
+@TriageBot what bugs did Harsh mention on discord today   → discord-only, Bug-filtered
+@TriageBot what is Harsh assigned in linear               → linear-only
+@TriageBot what is Harsh working on                       → both
+```
+
+A **Discord-scoped `issue_list`** ("what bugs did Harsh mention on discord") is
+*not* a Linear query — it's redirected to the Discord activity path so Linear is
+never queried for it. The reply header always reflects the source(s) actually
+used.
+
+### `issue_status` — one specific issue, by key or description
+
+```
+@TriageBot status of NFT-123
+@TriageBot what's the status of the DMs issue
+@TriageBot where are we on the payout bug
+@TriageBot tell me the description of NFT-610
+@TriageBot tell me more about NFT-610
+```
+
+**Detail level.** The query parser sets `detail` per phrasing: `"description"`
+("description of NFT-123", "what does NFT-123 say") **leads with the full issue
+description**; `"more"` ("tell me more about / details of NFT-123") shows the
+description **under** the summary; `"none"` (a plain status check) keeps the
+one-line summary + latest comment. The description is pulled from Linear (now
+SELECTed in `get_issue`), truncated to ~1500 chars — and further if needed to fit
+Discord's message ceiling — with a "…(full text in Linear)" pointer + URL so it's
+never silently dropped. An empty description is reported as "(no description set)".
+
+Flow (`bot._handle_issue_status`):
+
+- **Explicit key** (e.g. `NFT-123`) → `get_issue` directly; reply with title,
+  status, assignee, link, and latest comment. Missing key → honest "couldn't
+  find **NFT-123**".
+- **Free-text subject** → `linear_client.find_issues_by_text(subject)`, which
+  returns **all** open matches (open issues first, ranked by relevance then
+  recency):
+  - **exactly one match** (and no "list them all" phrasing) → full status answer
+    (re-fetched for the latest comment),
+  - **several matches, or phrasing that asks for all of them** ("all issues
+    containing DMs", "list the DM tickets") → the bot **lists every match**
+    (identifier + current status + title), capped at 10 with a "showing N of M"
+    note; it no longer forces a disambiguation question,
+  - **no match** → says plainly that no *open* issue matched "`<subject>`", names
+    what was searched, and offers to widen to closed issues.
+
+> **Note — matching spans more than titles.** `find_issues_by_text` uses Linear's
+> `searchIssues` full-text index (title + description + comments) and is
+> acronym/synonym-aware, so **both "DMs" and "direct messages" surface the same
+> direct-message issues** without the bot maintaining its own alias table. Quality
+> still tracks how issues are worded, but is not limited to the exact title.
 
 ### `issue_list` — questions about Linear issues
 
@@ -245,12 +330,18 @@ Flow (`bot._handle_person_activity`):
    within the window.
 3. **Discord side** — `scan_recent_messages(...)` walks `channel.history` across
    monitored channels only, matching by Discord ID (preferred) or display name.
-4. **Synthesis** — both result sets are handed to `classifier.summarize_person_activity`,
-   which writes one concise reply: a **Working on (Linear)** list (identifier,
-   title, status, link) and a 1–3 sentence **Recent Discord activity** summary
-   with jump links. The model **summarises** Discord — it must not dump raw logs
-   or invent issues/links; an empty source is reported as "nothing in `<source>`".
-   If the synthesis call fails, a deterministic fallback render is used instead.
+4. **Synthesis** — the in-scope result sets are handed to
+   `classifier.summarize_person_activity`, which writes one concise reply. Under
+   `source="both"` that's a **Working on (Linear)** list (identifier, title,
+   status, link) *and* a 1–3 sentence **Recent Discord activity** summary with
+   jump links. Under a scoped `source` **only that one section is produced** —
+   the out-of-scope data is never even sent to the model, so a Discord-only
+   answer can't leak a Linear block (and vice versa). A `category` (e.g. `Bug`)
+   narrows both sides — Linear issues are label-filtered, the Discord summary is
+   biased to matching messages. The model **summarises** Discord — it must not
+   dump raw logs or invent issues/links; an empty source is "nothing in
+   `<source>`". If the synthesis call fails, a source-aware deterministic
+   fallback render is used instead.
 
 The window defaults to `QUERY_DISCORD_LOOKBACK_DAYS` when the question gives no
 time frame.
@@ -275,12 +366,31 @@ time frame.
   on display-name matching, which is weaker when the two names diverge.
 - Channels the bot can't read are skipped (logged), not errored.
 
-### Hard guarantees (both intents)
+### Edited messages (QUERY MODE only)
 
-- Query mode is **read-only**. It never calls `create_issue`, `add_comment`,
-  or `set_issue_status`.
+Editing a message re-runs **only** query mode — never the report path
+(`bot.on_raw_message_edit`, raw so edits to uncached/older messages still fire):
+
+- Same pre-filters as `on_message`: ignores bots, non-allowlisted authors, and
+  channels outside `MONITORED_CHANNEL_IDS`; skips no-op edits (embed/pin
+  resolves) when the text is provably unchanged.
+- If the **edited** text reads as an @-mention question → the same
+  `_handle_query` path runs on the **new** text and posts a **fresh reply** (a
+  new message — the old answer is not edited). So editing "what is Sam working
+  on" → "what is Harsh working on" makes the bot answer for Harsh.
+- If the edited message is **not** a query (an ordinary report or other message)
+  → **nothing happens**. An edited bug report never creates a second ticket and
+  never touches the create/comment/status pipeline.
+
+### Hard guarantees (all intents)
+
+- Query mode — including edit re-triggers — is **read-only**. It never calls
+  `create_issue`, `add_comment`, or `set_issue_status`.
 - Query mode runs **before** the report pipeline, so a question can never
-  become a ticket.
+  become a ticket; edits are never routed into the report pipeline at all.
+- A source-scoped answer never shows a section for the other source.
+- `issue_status` never replies with a bare null — every branch (hit, ambiguous,
+  miss, bad input) produces a useful message.
 - Reply-pings don't trigger queries — only explicit `<@bot_id>` mentions do.
 - Anyone in the channel can query (no reporter allowlist for queries).
 
@@ -299,8 +409,9 @@ Clean module roles:
 - **`linear_client.py`** — all Linear reads/writes over GraphQL. No Linear MCP.
   Helpers: `resolve_label_ids`, `resolve_assignee`, `create_issue`,
   `add_comment`, `set_issue_status`, `list_team_states`, `search_issues`,
+  `find_issues_by_text` (fuzzy title/keyword lookup for `issue_status`),
   `get_issue`, `list_issues`, plus the query-mode reads `list_team_members`,
-  `active_issues_for_user`, `recent_issues_created_by`.
+  `active_issues_for_user` (optionally label-filtered), `recent_issues_created_by`.
 - **`query.py`** — read-only building blocks for `person_activity`:
   `scan_recent_messages` (Discord history scan over monitored channels) and
   `resolve_person` (free-text name → Linear user + Discord user). Takes the
@@ -378,6 +489,11 @@ See `.env.example` for the full list with comments. Key knobs:
   mode covers most query needs via @-mention.
 - **Embedding-based duplicate detection** — current dedup is title-equality on
   open issues. Worthwhile v2 with `voyage-3` or similar.
+- **Custom synonym/alias map** — `issue_status` fuzzy search already leans on
+  Linear's full-text index (title + description + comments), which is
+  acronym/synonym-aware (DMs ↔ "direct messages" resolves today). A bot-side alias
+  map for domain jargon Linear's index *doesn't* connect would be a further step,
+  but isn't needed for the common cases.
 - **Per-channel category overrides** — easy to add in `bot._decide_plan`.
 - **Metrics** — add Prometheus counters around classified / approved /
   rejected / commented / dup-matched.

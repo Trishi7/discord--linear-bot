@@ -99,23 +99,32 @@ QUERY_SYSTEM_PROMPT = """You parse Discord questions for the NFThing / membrane
 engineering team into structured filters. You ONLY parse — you never fetch,
 create, or modify anything.
 
-There are TWO kinds of question:
+There are THREE kinds of question:
 - person_activity: "what is <person> working on / up to / handling these days",
   "what's <person> been doing" — a status check on ONE teammate. This blends the
   person's Linear assignments with their recent Discord activity.
-- issue_list: anything about the team's Linear ISSUES — lists, filters, searches,
-  or a single issue lookup. E.g. "list my open bugs", "issues Sid raised in the
-  last 2 weeks", "what's open with the Bug label", "status of NFT-123".
+- issue_status: a status check on ONE specific ISSUE — "what's the status of X",
+  "where are we on X", "update on the X issue", "any progress on the X". Set
+  `subject` to the free-text description of that issue (e.g. "DMs", "birthday
+  feature", "payout bug"). If the asker names an explicit issue KEY (e.g.
+  "NFT-123", "status of NFT2-45"), set `identifier` to that key and leave
+  `subject`="".
+- issue_list: anything about the team's Linear ISSUES as a GROUP — lists, filters,
+  searches. E.g. "list my open bugs", "issues Sid raised in the last 2 weeks",
+  "what's open with the Bug label".
 
 Output STRICT JSON only (no preamble, no fences) with this schema:
 {
   "is_query":     true | false,
-  "intent":       "person_activity" | "issue_list" | "none",
+  "intent":       "person_activity" | "issue_status" | "issue_list" | "none",
+  "source":       "discord" | "linear" | "both",  // which system to look at; "both" if unscoped
   "person":       string,            // person_activity: the teammate's name; "" otherwise
-  "identifier":   string,            // issue_list: e.g. "NFT-123"; "" if not referenced
+  "subject":      string,            // issue_status: free-text description of the ONE issue; "" otherwise
+  "identifier":   string,            // issue_status/issue_list: e.g. "NFT-123"; "" if not referenced
+  "detail":       "none" | "more" | "description",  // issue_status: how much of the issue to show (see rules)
   "search_term":  string,            // issue_list: free-text keywords for fuzzy title search; "" if n/a
   "reporter":     string,            // issue_list: "me" if the asker references themselves; a name otherwise; "" if none
-  "labels":       array of strings,  // subset of ["Bug","Feature","Improvement","BE","FE","UI"]; [] if not specified
+  "labels":       array of strings,  // category filter — subset of ["Bug","Feature","Improvement","BE","FE","UI"]; [] if not specified
   "states":       array of strings,  // subset of ["open","closed","in_progress","done","cancelled"]; [] = any state
   "window_days":  integer            // 0 = no time window
 }
@@ -124,13 +133,32 @@ Rules:
 - is_query=true ONLY if the message is a person_activity or issue_list question.
   Greetings, bug reports, off-topic chat → is_query=false, intent="none".
 - intent="person_activity" when the question asks what a specific PERSON is working
-  on / up to / handling / has been doing. Set `person` to that name (preserve
-  casing); leave issue-filter fields (identifier/search_term/reporter) at "".
-  "what am I working on" / "what's on my plate" → person="me".
-- intent="issue_list" for everything else about issues (lists, filters, searches,
-  single-issue lookups). Set `identifier` for a specific key (e.g. "status of
-  NFT-123") and leave other filter fields at defaults; otherwise use
-  reporter/labels/states/window_days/search_term as applicable. Leave `person`="".
+  on / up to / handling / has been doing / mentioned / said. Set `person` to that
+  name (preserve casing); leave issue-filter fields (identifier/search_term/
+  reporter) at "". "what am I working on" / "what's on my plate" → person="me".
+- intent="issue_status" when the question asks for the state/progress/update of
+  ONE specific issue ("what's the status of the DMs issue", "where are we on the
+  payout bug", "update on NFT-123"). If an explicit key is present set
+  `identifier` and leave `subject`=""; otherwise set `subject` to the issue's
+  free-text description and leave `identifier`="". Leave `person`="".
+- detail (issue_status only; "none" for every other intent):
+    "description" — the asker explicitly wants the issue's DESCRIPTION / body
+                    text: "description of NFT-123", "what does NFT-123 say",
+                    "read me NFT-123", "what's written in the DMs issue".
+    "more"        — a general request for more than the one-line status:
+                    "tell me more about NFT-123", "details of NFT-123", "give me
+                    the full picture on the payout bug".
+    "none"        — a plain status check ("status of NFT-123", "where are we on
+                    the DMs issue"). Default when unsure.
+- intent="issue_list" for questions about issues as a GROUP (lists, filters,
+  searches across many issues). Use reporter/labels/states/window_days/
+  search_term as applicable. Leave `person`="" and `subject`="".
+- source: which system the question is scoped to. Infer from wording:
+    "on discord", "in the channel", "posted", "mentioned" / "said" / "wrote"  → "discord"
+    "in linear", "assigned to", "ticket", "issue", "status of", "label"        → "linear"
+    no explicit source                                                         → "both"
+  When BOTH a Discord verb and a Linear noun appear, prefer the explicit scope the
+  asker is standing in (e.g. "what bugs did X mention on discord" → "discord").
 - "I" / "my" / "me" → reporter="me" (issue_list). A named person → reporter="<Name>".
 - Time phrases → window_days: "today"=1, "this week"=7, "last 2 weeks"=14,
   "this month"=30, no time reference → 0.
@@ -140,8 +168,11 @@ Rules:
     "cancelled" / "wontfix"                          → ["cancelled"]
     "in progress" / "WIP" / "being worked on"        → ["in_progress"]
     none mentioned                                   → []
-- labels: only "Bug" / "Feature" / "Improvement" / "BE" / "FE" / "UI" are valid.
-  Map "frontend"→"FE", "backend"→"BE", "ui"/"UX"→"UI". Drop anything else.
+- labels: a CATEGORY filter, valid for BOTH intents. Only "Bug" / "Feature" /
+  "Improvement" / "BE" / "FE" / "UI" are valid. Map "bug"/"bugs"→"Bug",
+  "feature(s)"→"Feature", "frontend"→"FE", "backend"→"BE", "ui"/"UX"→"UI". Drop
+  anything else. E.g. "what BUGS did Harsh mention" → person_activity, person=
+  "Harsh", labels=["Bug"] so the answer narrows to bug reports.
 - search_term: any free-text keywords from the question not covered by other
   fields. "" if not applicable.
 - Don't invent details. Default fields rather than guess.
@@ -152,19 +183,27 @@ PERSON_ACTIVITY_SYNTHESIS_PROMPT = """You write a SHORT status summary of what o
 teammate is working on, for the NFThing / membrane engineering team, as a Discord
 reply.
 
-You are given two data sources that were ALREADY gathered for you: the person's
-active/assigned Linear issues, and their recent Discord messages from monitored
-channels. You ONLY summarise what is in that data. You never fetch anything, and
-you must NOT invent issues, identifiers, links, statuses, or activity.
+The data was ALREADY gathered for you. The payload's `source` field tells you WHICH
+sources were consulted — and you must include ONLY the section(s) for those sources:
+  - "discord" → ONLY the Discord section. Do NOT add a Linear section at all.
+  - "linear"  → ONLY the Linear section. Do NOT add a Discord section at all.
+  - "both"    → both sections.
+You ONLY summarise what is in the data. Never fetch anything, and never invent
+issues, identifiers, links, statuses, or activity.
 
-Write GitHub-flavoured markdown in exactly this shape:
+If a `category` is present (e.g. "Bug"), narrow the whole answer to that category:
+mention only matching issues / messages, and reflect it in the header (e.g.
+"**<Person> — recent bug reports**").
 
-**<Person> — what they're working on**
+Write GitHub-flavoured markdown. Header line first:
+**<Person> — what they're working on**   (adjust wording to source/category)
 
+Linear section (ONLY when source is "linear" or "both"):
 **Working on (Linear):**
 - One bullet per issue: `IDENTIFIER` — <title> — _<status>_ — <url>
 - If there are no Linear issues, write exactly: _nothing in Linear_
 
+Discord section (ONLY when source is "discord" or "both"):
 **Recent Discord activity (last N days):**
 - A 1–3 sentence natural-language summary of what they've been posting (deploys,
   blockers, questions, PRs, decisions). Weave in jump links to the 1–3 most
@@ -173,6 +212,8 @@ Write GitHub-flavoured markdown in exactly this shape:
 - If there are no Discord messages, write exactly: _nothing in Discord_
 
 Hard rules:
+- NEVER show a section for a source that is not in `source`. A Discord-only answer
+  must contain no Linear block whatsoever, and vice versa.
 - Use ONLY identifiers, titles, statuses, and URLs present in the Linear data.
   Never fabricate a link or an issue.
 - Use ONLY jump_url values present in the Discord data. Never invent a link.
@@ -412,13 +453,22 @@ class Classifier:
 
         is_query = bool(parsed.get("is_query", False))
         intent = parsed.get("intent", "none")
-        if intent not in {"person_activity", "issue_list", "none"}:
+        if intent not in {"person_activity", "issue_status", "issue_list", "none"}:
             intent = "none"
 
+        source = str(parsed.get("source") or "both").strip().lower()
+        if source not in {"discord", "linear", "both"}:
+            source = "both"
+
         person = str(parsed.get("person") or "").strip()
+        subject = str(parsed.get("subject") or "").strip()
         identifier = str(parsed.get("identifier") or "").strip()
         search_term = str(parsed.get("search_term") or "").strip()
         reporter = str(parsed.get("reporter") or "").strip()
+
+        detail = str(parsed.get("detail") or "none").strip().lower()
+        if detail not in {"none", "more", "description"}:
+            detail = "none"
 
         raw_labels = parsed.get("labels") or []
         if not isinstance(raw_labels, list):
@@ -447,8 +497,11 @@ class Classifier:
         normalised = {
             "is_query": is_query,
             "intent": intent,
+            "source": source,
             "person": person,
+            "subject": subject,
             "identifier": identifier,
+            "detail": detail,
             "search_term": search_term,
             "reporter": reporter,
             "labels": labels,
@@ -465,17 +518,26 @@ class Classifier:
         window_days: int,
         linear_issues: list[dict],
         discord_messages: list[dict],
+        source: str = "both",
+        category: str = "",
         coverage_note: str = "",
     ) -> Optional[str]:
         """Synthesise ONE concise reply describing what `person` is working on,
-        from the Linear + Discord data already gathered. Read-only — summarises
-        only; never fetches or invents. Returns the reply text, or None on any
-        API/parse failure so the caller can fall back to a deterministic render.
+        from the data already gathered. `source` ("discord"|"linear"|"both")
+        controls which section(s) the reply includes; `category` (e.g. "Bug")
+        narrows it. Read-only — summarises only; never fetches or invents.
+        Returns the reply text, or None on any API/parse failure so the caller
+        can fall back to a deterministic render.
         """
+        source = (source or "both").strip().lower()
+        if source not in {"discord", "linear", "both"}:
+            source = "both"
         log.info(
-            "[summarize] step 1/3: person=%r window=%d linear=%d discord=%d",
+            "[summarize] step 1/3: person=%r window=%d source=%s category=%r linear=%d discord=%d",
             person,
             window_days,
+            source,
+            category,
             len(linear_issues or []),
             len(discord_messages or []),
         )
@@ -511,8 +573,12 @@ class Classifier:
         payload = {
             "person": person,
             "window_days": window_days,
-            "linear_issues": slim_issues,
-            "discord_messages": slim_msgs,
+            "source": source,
+            "category": category or None,
+            # Only surface the data for the sources actually in scope, so the
+            # model can't be tempted to render a section it shouldn't.
+            "linear_issues": slim_issues if source in ("linear", "both") else [],
+            "discord_messages": slim_msgs if source in ("discord", "both") else [],
             "coverage_note": coverage_note,
         }
         user_prompt = (

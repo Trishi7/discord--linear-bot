@@ -13,6 +13,7 @@ posted to the same channel instead.
 """
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -68,6 +69,20 @@ _QUERY_STATE_TYPES = {
 
 # Cap on how many issues we list in a single query-mode reply.
 QUERY_LIST_LIMIT = 10
+
+# Discord single-message ceiling we render within (matches `_safe_reply`'s clip).
+# When an issue description is requested we budget against this so the "full text
+# in Linear" pointer always survives rather than being silently clipped away.
+DISCORD_REPLY_BUDGET = 1900
+# Hard cap on how much raw Linear description we inline before pointing to Linear.
+DESCRIPTION_MAX_CHARS = 1500
+
+# Phrasing that asks an issue_status question to enumerate EVERY matching issue
+# ("all issues containing DMs", "list the DM tickets") rather than pinpoint one.
+# When this matches we list matches instead of answering as a single issue.
+_WANTS_ALL_MATCHES_RE = re.compile(
+    r"\b(all|list|every|each|both|which\s+ones|what\s+are\s+the)\b", re.IGNORECASE
+)
 
 # Cap on how far we walk the reply chain / how much channel history we scan
 # when gathering messages associated with one.
@@ -222,11 +237,12 @@ class TriageBot(discord.Client):
         # never become a ticket. Trigger: explicit @-mention of self in a
         # monitored channel OR the approval channel. Replies in the same
         # channel. Read-only — never creates or modifies anything.
-        in_query_channel = (
-            message.channel.id in config.MONITORED_CHANNEL_IDS
-            or message.channel.id == config.APPROVAL_CHANNEL_ID
-        )
-        if in_query_channel and self._is_self_mentioned_explicitly(message):
+        #
+        # NOTE: query mode deliberately runs BEFORE the reporter allowlist — any
+        # user may ask the bot a question. `on_raw_message_edit` reuses the exact
+        # same gate (`_is_query_trigger`) so an edited question re-fires for the
+        # same set of messages that would have triggered a query when first sent.
+        if self._is_query_trigger(message):
             handled = await self._handle_query(message)
             if handled:
                 return
@@ -405,6 +421,84 @@ class TriageBot(discord.Client):
             await self._execute_immediately(message, plan)
 
         log.info("[on_message] msg=%s DONE", message.id)
+
+    async def on_raw_message_edit(
+        self, payload: discord.RawMessageUpdateEvent
+    ) -> None:
+        """Reconsider an EDITED message — QUERY MODE ONLY, never the report
+        pipeline. If the edited text reads as a question addressed to the bot,
+        we re-run the same query path on the NEW text and post a FRESH reply
+        (a new message — we never edit the old answer). If the edit is an
+        ordinary message (a report or anything else), we do NOTHING: editing a
+        bug report must not create a second ticket or touch the create/comment/
+        status pipeline.
+
+        Raw (not on_message_edit) so edits to messages the bot hasn't cached
+        still fire. Reuses the exact on_message query gate (`_is_query_trigger`)
+        and the existing `_handle_query` path — no duplicated logic."""
+        # Cheap early-out before any network fetch: only the channels query mode
+        # listens on (monitored OR approval).
+        if not (
+            payload.channel_id in config.MONITORED_CHANNEL_IDS
+            or payload.channel_id == config.APPROVAL_CHANNEL_ID
+        ):
+            return
+
+        # Resolve the channel — prefer the cache, but fall back to REST: a cache
+        # miss here was silently swallowing edits and dropping the re-trigger.
+        channel = self.get_channel(payload.channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(payload.channel_id)
+            except discord.DiscordException as e:
+                log.info(
+                    "[edit] msg=%s channel %s unresolvable (%s); skip",
+                    payload.message_id, payload.channel_id, type(e).__name__,
+                )
+                return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.DiscordException as e:
+            log.info(
+                "[edit] msg=%s fetch after edit failed (%s); skip",
+                payload.message_id, type(e).__name__,
+            )
+            return
+
+        # Skip non-content edits (embeds resolving, pins, etc.) — nothing new to
+        # reconsider when we can prove the text is unchanged.
+        cached = payload.cached_message
+        if cached is not None and cached.content == message.content:
+            log.debug("[edit] msg=%s content unchanged; skip", message.id)
+            return
+
+        log.info(
+            "[edit] detected edit msg=%s author=%s(%s) channel=#%s len=%d",
+            message.id,
+            _display(message.author),
+            getattr(message.author, "id", "?"),
+            getattr(message.channel, "name", "?"),
+            len(message.content or ""),
+        )
+
+        # QUERY MODE ONLY — same gate as on_message. If the edited text isn't a
+        # question addressed to the bot, do NOTHING: edits are NEVER routed into
+        # the create/comment/status pipeline (editing a report can't spawn a
+        # second ticket).
+        if not self._is_query_trigger(message):
+            log.debug(
+                "[edit] msg=%s not a bot query; ignoring (no report path for edits)",
+                message.id,
+            )
+            return
+
+        log.info("[edit] msg=%s re-running QUERY MODE on edited text", message.id)
+        handled = await self._handle_query(message)
+        if not handled:
+            log.info(
+                "[edit] msg=%s edited text parsed as not-a-Linear-question; no reply",
+                message.id,
+            )
 
     # -- thread / context (unchanged) ------------------------------------
 
@@ -1161,6 +1255,21 @@ class TriageBot(discord.Client):
 
     # -- query mode (read-only) ------------------------------------------
 
+    def _is_query_trigger(self, message: discord.Message) -> bool:
+        """The single source of truth for "should this message be handled as a
+        query?" — shared by `on_message` and `on_raw_message_edit` so an edit
+        re-fires for exactly the same messages a fresh send would. A trigger is:
+        a non-bot author, in a monitored channel OR the approval channel, with an
+        explicit @-mention of the bot. Deliberately does NOT gate on the reporter
+        allowlist — query mode is open to anyone (unlike the report pipeline)."""
+        if message.author.bot:
+            return False
+        in_query_channel = (
+            message.channel.id in config.MONITORED_CHANNEL_IDS
+            or message.channel.id == config.APPROVAL_CHANNEL_ID
+        )
+        return in_query_channel and self._is_self_mentioned_explicitly(message)
+
     def _is_self_mentioned_explicitly(self, message: discord.Message) -> bool:
         """True if the bot's user is @-mentioned in the message TEXT.
         Reply-pings (which auto-include the bot in `message.mentions`) don't
@@ -1243,6 +1352,11 @@ class TriageBot(discord.Client):
             log.info("[query] DONE msg=%s (person_activity)", message.id)
             return True
 
+        if intent == "issue_status":
+            await self._handle_issue_status(message, parsed)
+            log.info("[query] DONE msg=%s (issue_status)", message.id)
+            return True
+
         if intent == "issue_list":
             await self._handle_issue_list(message, parsed)
             log.info("[query] DONE msg=%s (issue_list)", message.id)
@@ -1253,11 +1367,167 @@ class TriageBot(discord.Client):
         log.info("[query] intent %r not actionable; letting report path try", intent)
         return False
 
+    # -- query mode: issue_status (read-only) ----------------------------
+
+    async def _handle_issue_status(
+        self, message: discord.Message, parsed: dict
+    ) -> None:
+        """Answer "what's the status of X?" for ONE issue — by explicit key if
+        given, otherwise by fuzzy subject search. Every branch replies with a
+        useful message (never a bare null). Read-only — only reads from Linear.
+        """
+        identifier = (parsed.get("identifier") or "").strip()
+        subject = (parsed.get("subject") or parsed.get("search_term") or "").strip()
+        # "none" | "more" | "description" — how much of the issue body to show.
+        detail = (parsed.get("detail") or "none").strip().lower()
+        if detail not in ("none", "more", "description"):
+            detail = "none"
+
+        # 1) Explicit key wins — fetch directly, no search.
+        if identifier:
+            log.info("[query.issue_status] identifier=%r detail=%s → get_issue", identifier, detail)
+            try:
+                issue = await self.linear.get_issue(identifier)
+            except Exception:
+                log.exception("[query.issue_status] get_issue raised")
+                issue = None
+            if issue:
+                await self._safe_reply(message, self._format_single_issue(issue, detail=detail))
+            else:
+                await self._safe_reply(
+                    message, f"I couldn't find issue **{identifier}** in Linear."
+                )
+            return
+
+        # 2) No key — need a subject to search on.
+        if not subject:
+            await self._safe_reply(
+                message,
+                "Which issue do you mean? Give me its key (e.g. `NFT-123`) or a few "
+                "words from its title (e.g. `status of the payout bug`).",
+            )
+            return
+
+        log.info("[query.issue_status] subject=%r → find_issues_by_text", subject)
+        try:
+            matches = await self.linear.find_issues_by_text(subject, include_closed=False)
+        except Exception:
+            log.exception("[query.issue_status] find_issues_by_text raised")
+            await self._safe_reply(
+                message, "⚠️ Sorry — Linear search failed. See bot logs."
+            )
+            return
+
+        # 2a) Nothing open matched — be honest, name what was searched, offer closed.
+        if not matches:
+            await self._safe_reply(
+                message,
+                f'No **open** Linear issue matched "{subject}" — I searched issue '
+                f"title keywords. It may be closed or titled differently. Want me to "
+                f"include closed issues, or try different words?",
+            )
+            return
+
+        # Did the asker want the WHOLE set ("all issues containing DMs", "list
+        # the DM tickets")? Check the raw question and the parsed subject.
+        wants_all = bool(
+            _WANTS_ALL_MATCHES_RE.search(self._strip_self_mention(message.content))
+            or _WANTS_ALL_MATCHES_RE.search(subject)
+        )
+
+        # 2b) Exactly one match and no "list them all" phrasing — answer fully
+        # (fetch details so we can show the latest comment).
+        if len(matches) == 1 and not wants_all:
+            top = matches[0]
+            issue = None
+            ident = top.get("identifier")
+            if ident:
+                try:
+                    issue = await self.linear.get_issue(ident)
+                except Exception:
+                    log.exception("[query.issue_status] detail fetch raised; using search hit")
+            await self._safe_reply(
+                message,
+                self._format_single_issue(issue, detail=detail) if issue
+                else self._format_single_issue(self._match_to_issue(top), detail=detail),
+            )
+            return
+
+        # 2c) Several matches (or an explicit "list them all") — enumerate every
+        # match with its current status. We don't force a disambiguation question.
+        log.info(
+            "[query.issue_status] listing %d match(es) (wants_all=%s)",
+            len(matches), wants_all,
+        )
+        await self._safe_reply(
+            message, self._format_status_matches(subject, matches)
+        )
+
+    @staticmethod
+    def _match_to_issue(m: dict) -> dict:
+        """Map a find_issues_by_text hit onto the _format_single_issue shape."""
+        return {
+            "identifier": m.get("identifier"),
+            "title": m.get("title"),
+            "state": m.get("state_name"),
+            "url": m.get("url"),
+            "assignee": m.get("assignee_name"),
+            "labels": [],
+            "latest_comment": None,
+        }
+
+    def _format_status_matches(self, subject: str, matches: list[dict]) -> str:
+        """List every open issue matching `subject`, each with its identifier,
+        title, and current status. Used when a status question matches several
+        issues (or explicitly asks for all of them) — no disambiguation prompt."""
+        total = len(matches)
+        shown = matches[:QUERY_LIST_LIMIT]
+        header = f'**{total}** open issue(s) match "{subject}":'
+        lines = [header]
+        for m in shown:
+            ident = m.get("identifier") or "?"
+            title = (m.get("title") or "(untitled)").strip()
+            if len(title) > 80:
+                title = title[:77] + "…"
+            state = m.get("state_name") or "?"
+            url = m.get("url") or ""
+            link = f"[{ident}]({url})" if url else ident
+            lines.append(f"• {link} — _{state}_ — {title}")
+        if total > len(shown):
+            lines.append(f"_(showing {len(shown)} of {total} — narrow the wording to trim.)_")
+        lines.append("_Ask about any identifier (e.g. NFT-123) for the full detail + latest comment._")
+        return "\n".join(lines)
+
     # -- query mode: issue_list (read-only) ------------------------------
 
     async def _handle_issue_list(self, message: discord.Message, parsed: dict) -> None:
-        """Existing behaviour: reporter / date / label / state → issues, or a
-        single-identifier lookup. Read-only."""
+        """reporter / date / label / state → issues, or a single-identifier
+        lookup. Read-only.
+
+        A Discord-scoped issue question ("what bugs did Harsh mention on
+        discord") is NOT a Linear query — it's a request to summarise Discord.
+        Redirect those to the person_activity Discord path so we never hit
+        Linear for them."""
+        source = (parsed.get("source") or "both").strip().lower()
+        if source == "discord":
+            reporter = (parsed.get("reporter") or "").strip()
+            search_term = (parsed.get("search_term") or "").strip()
+            person = reporter or search_term
+            if not person:
+                await self._safe_reply(
+                    message,
+                    "That looks like a Discord question — tell me *whose* messages "
+                    "to summarise (e.g. `what bugs did Harsh mention on discord`).",
+                )
+                log.info("[query.issue_list] discord-scoped but no person; asked for one")
+                return
+            log.info("[query.issue_list] discord-scoped → person_activity(discord) person=%r", person)
+            await self._handle_person_activity(
+                message,
+                {**parsed, "intent": "person_activity", "source": "discord", "person": person},
+            )
+            return
+
         log.info("[query.issue_list] step 4/4: running against Linear")
         try:
             issues, single = await self._run_issue_list_query(
@@ -1360,14 +1630,25 @@ class TriageBot(discord.Client):
     async def _handle_person_activity(
         self, message: discord.Message, parsed: dict
     ) -> None:
-        """Combine a person's Linear assignments with their recent Discord
-        activity into one synthesised reply. Read-only throughout — never
-        creates, comments, or modifies anything."""
+        """Answer "what is <person> up to?" — scoped to Discord, Linear, or
+        both per `parsed["source"]`. A source-scoped question hits ONLY that
+        source, so a Discord-only answer never carries a Linear section (and
+        vice versa). An optional category (`parsed["labels"]`, e.g. Bug) narrows
+        the result. Read-only throughout — never creates, comments, or modifies."""
+        source = (parsed.get("source") or "both").strip().lower()
+        if source not in ("discord", "linear", "both"):
+            source = "both"
+        want_discord = source in ("discord", "both")
+        want_linear = source in ("linear", "both")
+
+        labels = [l for l in (parsed.get("labels") or []) if isinstance(l, str)]
+        category = labels[0] if labels else ""
+
         person = (parsed.get("person") or "").strip()
         if person.lower() in ("", "me", "myself", "i"):
             # "what am I working on" — resolve against the asker themselves.
             person = _display(message.author)
-        log.info("[query.person] step 1/4: resolving %r", person)
+        log.info("[query.person] step 1/4: resolving %r (source=%s category=%r)", person, source, category)
 
         try:
             resolution = await query.resolve_person(
@@ -1385,7 +1666,18 @@ class TriageBot(discord.Client):
 
         linear_user = resolution.get("linear_user")
         discord_user = resolution.get("discord_user")
-        if not linear_user and not discord_user:
+
+        # A Linear-scoped question needs a Linear identity; a Discord-scoped one
+        # can still scan by name even if the person never posted before.
+        if want_linear and not want_discord and not linear_user:
+            log.info("[query.person] linear-scoped but no Linear match")
+            await self._safe_reply(
+                message,
+                f'I couldn\'t find anyone called "{person}" in Linear. '
+                f"Try their exact Linear name or email.",
+            )
+            return
+        if not linear_user and not discord_user and want_discord and want_linear:
             log.info("[query.person] no match in either system")
             await self._safe_reply(
                 message,
@@ -1396,55 +1688,85 @@ class TriageBot(discord.Client):
 
         window_days = int(parsed.get("window_days", 0) or 0) or config.QUERY_DISCORD_LOOKBACK_DAYS
         log.info(
-            "[query.person] step 2/4: linear=%s discord=%s window=%dd",
+            "[query.person] step 2/4: linear=%s discord=%s window=%dd source=%s",
             (linear_user or {}).get("displayName"),
             (discord_user or {}).get("display_name"),
             window_days,
+            source,
         )
 
-        # LINEAR side — active/assigned issues updated within the window.
+        # LINEAR side — active/assigned issues updated within the window. Only
+        # touched when the question is Linear-scoped (or unscoped).
         linear_issues: list[dict] = []
-        if linear_user and linear_user.get("id"):
+        if want_linear and linear_user and linear_user.get("id"):
             updated_after = self._cutoff_iso(window_days)
             try:
                 linear_issues = await self.linear.active_issues_for_user(
-                    linear_user["id"], updated_after
+                    linear_user["id"], updated_after, label_names=labels or None
                 )
             except Exception:
                 log.exception("[query.person] active_issues_for_user raised; continuing")
                 linear_issues = []
 
-        # DISCORD side — recent posts in monitored channels (id preferred).
+        # DISCORD side — recent posts in monitored channels (id preferred). Only
+        # touched when the question is Discord-scoped (or unscoped).
         discord_messages: list[dict] = []
-        scan_id = (discord_user or {}).get("id")
-        scan_name = None if scan_id else (discord_user or {}).get("display_name") or person
-        try:
-            discord_messages = await query.scan_recent_messages(
-                self,
-                author_id=scan_id,
-                author_name=scan_name,
-                days=window_days,
-                max_per_channel=config.QUERY_MAX_MESSAGES_PER_CHANNEL,
-            )
-        except Exception:
-            log.exception("[query.person] scan_recent_messages raised; continuing")
-            discord_messages = []
+        if want_discord:
+            scan_id = (discord_user or {}).get("id")
+            scan_name = None if scan_id else (discord_user or {}).get("display_name") or person
+            try:
+                discord_messages = await query.scan_recent_messages(
+                    self,
+                    author_id=scan_id,
+                    author_name=scan_name,
+                    days=window_days,
+                    max_per_channel=config.QUERY_MAX_MESSAGES_PER_CHANNEL,
+                )
+            except Exception:
+                log.exception("[query.person] scan_recent_messages raised; continuing")
+                discord_messages = []
 
         log.info(
-            "[query.person] step 3/4: linear_issues=%d discord_messages=%d",
+            "[query.person] step 3/4: linear_issues=%d discord_messages=%d (source=%s)",
             len(linear_issues),
             len(discord_messages),
+            source,
         )
 
-        # SYNTHESIS — one concise reply combining both sources.
         display = (
             (linear_user or {}).get("displayName")
             or (discord_user or {}).get("display_name")
             or person
         )
-        coverage_note = (
-            f"Discord: last {window_days} days, monitored channels only."
-        )
+
+        # Nothing in ANY in-scope source → say so explicitly, naming what was
+        # checked, rather than emitting a bare "<Person> — what they're working
+        # on" header with empty sections (which reads like a broken reply).
+        if not linear_issues and not discord_messages:
+            scopes = []
+            if want_linear:
+                scopes.append("Linear (assigned/active)")
+            if want_discord:
+                scopes.append(f"Discord (last {window_days} days, monitored channels)")
+            log.info(
+                "[query.person] nothing found for %r in %s", display, " or ".join(scopes)
+            )
+            await self._safe_reply(
+                message,
+                f"Nothing found for **{display}** in {' or '.join(scopes)}.",
+            )
+            return
+
+        # SYNTHESIS — one concise reply covering ONLY the source(s) in scope.
+        note_parts = []
+        if want_discord:
+            note_parts.append(f"Discord: last {window_days} days, monitored channels only.")
+        if want_linear:
+            note_parts.append("Linear: active/assigned issues in the window.")
+        if category:
+            note_parts.append(f"Filtered to {category}.")
+        coverage_note = " ".join(note_parts)
+
         reply = None
         try:
             reply = await self.classifier.summarize_person_activity(
@@ -1452,6 +1774,8 @@ class TriageBot(discord.Client):
                 window_days=window_days,
                 linear_issues=linear_issues,
                 discord_messages=discord_messages,
+                source=source,
+                category=category,
                 coverage_note=coverage_note,
             )
         except Exception:
@@ -1459,7 +1783,8 @@ class TriageBot(discord.Client):
 
         if not reply:
             reply = self._fallback_person_activity(
-                display, window_days, linear_issues, discord_messages, coverage_note
+                display, window_days, linear_issues, discord_messages, coverage_note,
+                source=source, category=category,
             )
 
         log.info("[query.person] step 4/4: replying")
@@ -1486,44 +1811,64 @@ class TriageBot(discord.Client):
         linear_issues: list[dict],
         discord_messages: list[dict],
         coverage_note: str,
+        *,
+        source: str = "both",
+        category: str = "",
     ) -> str:
         """Deterministic render used when the synthesis model call is
-        unavailable. Same shape as the model output; no summarisation, just
-        the facts we already hold — never invents anything."""
-        lines = [f"**{person} — what they're working on**", "", "**Working on (Linear):**"]
-        if linear_issues:
-            for i in linear_issues[:QUERY_LIST_LIMIT]:
-                ident = i.get("identifier") or "?"
-                title = (i.get("title") or "(untitled)").strip()
-                if len(title) > 80:
-                    title = title[:77] + "…"
-                status = i.get("state_name") or "?"
-                url = i.get("url") or ""
-                link = f"[{ident}]({url})" if url else ident
-                lines.append(f"• {link} — {title} — _{status}_")
-        else:
-            lines.append("_nothing in Linear_")
+        unavailable. Same shape as the model output but scoped to `source`, so a
+        Discord-only answer carries NO Linear block (and vice versa). No
+        summarisation, just the facts we already hold — never invents anything."""
+        source = (source or "both").strip().lower()
+        want_linear = source in ("linear", "both")
+        want_discord = source in ("discord", "both")
 
-        lines.append("")
-        lines.append(f"**Recent Discord activity (last {window_days} days):**")
-        if discord_messages:
-            for m in discord_messages[:5]:
-                ts = m.get("timestamp")
-                when = ts.strftime("%b %d") if hasattr(ts, "strftime") else ""
-                snippet = (m.get("text") or "").strip().replace("\n", " ")
-                if len(snippet) > 120:
-                    snippet = snippet[:117] + "…"
-                jump = m.get("jump_url") or ""
-                ref = f" ([msg]({jump}))" if jump else ""
-                chan = m.get("channel") or "?"
-                lines.append(f"• _{when}_ #{chan}: {snippet or '(no text)'}{ref}")
-            if len(discord_messages) > 5:
-                lines.append(f"_(+{len(discord_messages) - 5} more)_")
-        else:
-            lines.append("_nothing in Discord_")
+        header = f"**{person} — what they're working on**"
+        if source == "discord":
+            header = f"**{person} — recent Discord activity**"
+        elif source == "linear":
+            header = f"**{person} — Linear issues**"
+        if category:
+            header += f" _({category})_"
+        lines = [header]
 
-        lines.append("")
-        lines.append(f"_{coverage_note}_")
+        if want_linear:
+            lines += ["", "**Working on (Linear):**"]
+            if linear_issues:
+                for i in linear_issues[:QUERY_LIST_LIMIT]:
+                    ident = i.get("identifier") or "?"
+                    title = (i.get("title") or "(untitled)").strip()
+                    if len(title) > 80:
+                        title = title[:77] + "…"
+                    status = i.get("state_name") or "?"
+                    url = i.get("url") or ""
+                    link = f"[{ident}]({url})" if url else ident
+                    lines.append(f"• {link} — {title} — _{status}_")
+            else:
+                lines.append("_nothing in Linear_")
+
+        if want_discord:
+            lines.append("")
+            lines.append(f"**Recent Discord activity (last {window_days} days):**")
+            if discord_messages:
+                for m in discord_messages[:5]:
+                    ts = m.get("timestamp")
+                    when = ts.strftime("%b %d") if hasattr(ts, "strftime") else ""
+                    snippet = (m.get("text") or "").strip().replace("\n", " ")
+                    if len(snippet) > 120:
+                        snippet = snippet[:117] + "…"
+                    jump = m.get("jump_url") or ""
+                    ref = f" ([msg]({jump}))" if jump else ""
+                    chan = m.get("channel") or "?"
+                    lines.append(f"• _{when}_ #{chan}: {snippet or '(no text)'}{ref}")
+                if len(discord_messages) > 5:
+                    lines.append(f"_(+{len(discord_messages) - 5} more)_")
+            else:
+                lines.append("_nothing in Discord_")
+
+        if coverage_note:
+            lines.append("")
+            lines.append(f"_{coverage_note}_")
         return "\n".join(lines)
 
     @staticmethod
@@ -1561,7 +1906,18 @@ class TriageBot(discord.Client):
             lines.append(f"_(showing {QUERY_LIST_LIMIT} of {len(issues)})_")
         return "\n".join(lines)
 
-    def _format_single_issue(self, issue: dict) -> str:
+    def _format_single_issue(self, issue: dict, *, detail: str = "none") -> str:
+        """Render one issue as a Discord reply.
+
+        detail:
+          - "none"        → summary line + assignee/labels + latest comment (as before).
+          - "more"        → summary, then the issue DESCRIPTION under it.
+          - "description" → LEAD with the full DESCRIPTION, then a compact summary.
+
+        A long description is truncated to ~DESCRIPTION_MAX_CHARS (and further, if
+        needed, to keep the whole reply within Discord's message ceiling) with a
+        "…(full text in Linear)" pointer + URL — never silently dropped. An issue
+        with no description says so explicitly when a description was requested."""
         ident = issue.get("identifier") or "?"
         title = (issue.get("title") or "(untitled)").strip()
         state = issue.get("state") or "?"
@@ -1569,22 +1925,54 @@ class TriageBot(discord.Client):
         link = f"[**{ident}**]({url})" if url else f"**{ident}**"
         assignee = issue.get("assignee") or "_unassigned_"
 
-        lines = [
+        summary = [
             f"{link} — _{state}_",
             f"**{title}**",
             f"Assignee: {assignee}",
         ]
         if issue.get("labels"):
-            lines.append(f"Labels: {', '.join(issue['labels'])}")
+            summary.append(f"Labels: {', '.join(issue['labels'])}")
 
-        latest = issue.get("latest_comment")
-        if latest and (latest.get("body") or "").strip():
-            body = latest["body"].strip()
-            if len(body) > 250:
-                body = body[:247] + "…"
-            author = latest.get("author") or "?"
-            lines.append("")
-            lines.append(f"_Latest comment by @{author}:_")
-            lines.append(f"> {body}")
+        # Plain status check — original behaviour, no description block.
+        if detail == "none":
+            latest = issue.get("latest_comment")
+            if latest and (latest.get("body") or "").strip():
+                body = latest["body"].strip()
+                if len(body) > 250:
+                    body = body[:247] + "…"
+                author = latest.get("author") or "?"
+                summary += ["", f"_Latest comment by @{author}:_", f"> {body}"]
+            return "\n".join(summary)
 
-        return "\n".join(lines)
+        # Description requested ("more" / "description") — budget the body against
+        # the reply ceiling so the Linear pointer can't get clipped off the end.
+        summary_text = "\n".join(summary)
+        budget = DISCORD_REPLY_BUDGET - len(summary_text) - 40  # 40 ≈ headers/separators
+        block = self._format_description_block(issue.get("description"), url, budget=budget)
+
+        if detail == "description":
+            # Lead with the description; compact summary follows.
+            return f"{block}\n\n{summary_text}"
+        # "more" — summary first, description underneath.
+        return f"{summary_text}\n\n**Description:**\n{block}"
+
+    @staticmethod
+    def _format_description_block(
+        description: Optional[str], url: str, *, budget: int
+    ) -> str:
+        """Render an issue description for inlining: trimmed to the smaller of
+        DESCRIPTION_MAX_CHARS and `budget`, with a Linear pointer when cut.
+        Empty/whitespace description → an explicit "(no description set)"."""
+        desc = (description or "").strip()
+        if not desc:
+            return "_(no description set)_"
+        limit = min(DESCRIPTION_MAX_CHARS, max(200, budget))
+        if len(desc) <= limit:
+            return desc
+        truncated = desc[:limit].rstrip()
+        pointer = (
+            f"\n\n_…(truncated — full text in Linear: {url})_"
+            if url
+            else "\n\n_…(truncated — full text in Linear)_"
+        )
+        return truncated + pointer

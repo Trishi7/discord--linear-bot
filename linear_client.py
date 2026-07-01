@@ -87,15 +87,22 @@ query TeamMembers($teamId: String!) {
 }
 """
 
+# NOTE: teamId is declared ID! (not String!) — the `team.id.eq` filter position
+# is an ID comparator; declaring it String! makes Linear reject the whole query
+# with GRAPHQL_VALIDATION_FAILED, which the callers swallow into []. `first` is a
+# variable so a caller can ask for a broad match set (status "list them all") or
+# a cheap top-N (duplicate detection).
 _SEARCH_ISSUES = """
-query SearchIssues($teamId: String!, $term: String!) {
-  searchIssues(term: $term, filter: { team: { id: { eq: $teamId } } }, first: 10) {
+query SearchIssues($teamId: ID!, $term: String!, $first: Int!) {
+  searchIssues(term: $term, filter: { team: { id: { eq: $teamId } } }, first: $first) {
     nodes {
       id
       identifier
       title
       url
+      updatedAt
       state { name type }
+      assignee { displayName name }
     }
   }
 }
@@ -107,6 +114,7 @@ query GetIssue($id: String!) {
     id
     identifier
     title
+    description
     url
     createdAt
     updatedAt
@@ -199,6 +207,9 @@ def _issue_node_to_dict(node: dict) -> dict:
         "id": node.get("id"),
         "identifier": node.get("identifier"),
         "title": node.get("title"),
+        # Only `_GET_ISSUE` selects `description`; list/search projections leave
+        # it out, so this is None for those (callers treat None as "not loaded").
+        "description": node.get("description"),
         "url": node.get("url"),
         "state": state.get("name"),
         "state_type": state.get("type"),
@@ -659,19 +670,21 @@ class LinearClient:
         user_id: str,
         updated_after: Optional[str] = None,
         *,
+        label_names: Optional[list[str]] = None,
         limit: int = 25,
     ) -> list[dict]:
         """Issues ASSIGNED to `user_id` on this team that are EITHER in a
         "started"-type workflow state OR were updated since `updated_after`
         (ISO-8601). The two conditions are OR-ed; pass `updated_after=None` to
-        fall back to "started"-only.
+        fall back to "started"-only. When `label_names` is given, only issues
+        carrying one of those labels are returned (a category filter).
 
         Returns {identifier, title, state_name, state_type, url, updatedAt,
         priority} dicts, newest-updated first. Returns [] on any error or when
         `user_id` is empty. Read-only, never raises."""
         log.info(
-            "[linear.active_issues_for_user] step 1/2: user=%s updated_after=%s limit=%d",
-            user_id, updated_after, limit,
+            "[linear.active_issues_for_user] step 1/2: user=%s updated_after=%s labels=%s limit=%d",
+            user_id, updated_after, label_names or [], limit,
         )
         if not user_id:
             return []
@@ -684,6 +697,8 @@ class LinearClient:
             "assignee": {"id": {"eq": user_id}},
             "or": or_clauses,
         }
+        if label_names:
+            f["labels"] = {"some": {"name": {"in": list(label_names)}}}
         try:
             data = await self._gql(_ASSIGNED_ISSUES, {"filter": f, "first": int(limit)})
         except Exception:
@@ -731,7 +746,7 @@ class LinearClient:
         try:
             data = await self._gql(
                 _SEARCH_ISSUES,
-                {"teamId": self._team_id, "term": query},
+                {"teamId": self._team_id, "term": query, "first": 10},
             )
         except Exception:
             log.exception("[linear.search_issues] search failed; returning []")
@@ -753,3 +768,74 @@ class LinearClient:
             return []
         log.info("[linear.search_issues] DONE: %d hits", len(results))
         return results
+
+    async def find_issues_by_text(
+        self, text: str, *, include_closed: bool = False, limit: int = 25
+    ) -> list[dict]:
+        """Fuzzy-find team issues whose title / keywords match `text` (e.g.
+        "DMs", "payout bug") for an issue-status lookup.
+
+        Returns ALL matches (up to `limit`) as a RANKED list of {identifier,
+        title, state_name, state_type, assignee_name, url, updatedAt}. Open
+        issues come first (closed/cancelled are dropped unless `include_closed`);
+        within a group Linear's own relevance order is kept, with recency as the
+        tiebreak. [] on empty input or any error. Read-only, never raises.
+
+        Matching uses Linear's `searchIssues` full-text index, which spans the
+        title, description, and comments and is acronym/synonym-aware — so both
+        "DMs" and "direct messages" surface the same direct-message issues; the
+        caller does not need to expand aliases itself.
+        """
+        log.info(
+            "[linear.find_issues_by_text] step 1/2: text=%r include_closed=%s limit=%d",
+            text, include_closed, limit,
+        )
+        if not text or not text.strip():
+            return []
+        # Ask the API for a generous match set so "list them all" isn't silently
+        # capped below `limit` by the query's own page size.
+        first = max(int(limit), 25)
+        try:
+            data = await self._gql(
+                _SEARCH_ISSUES,
+                {"teamId": self._team_id, "term": text.strip(), "first": first},
+            )
+        except Exception:
+            log.exception("[linear.find_issues_by_text] search failed; returning []")
+            return []
+
+        nodes = (data.get("searchIssues") or {}).get("nodes") or []
+        closed_types = {"completed", "canceled"}
+        ranked: list[dict] = []
+        for rank, n in enumerate(nodes):
+            if not n:
+                continue
+            state = n.get("state") or {}
+            stype = state.get("type")
+            is_open = stype not in closed_types
+            if not include_closed and not is_open:
+                continue
+            assignee = n.get("assignee") or {}
+            ranked.append(
+                {
+                    "identifier": n.get("identifier"),
+                    "title": n.get("title"),
+                    "state_name": state.get("name"),
+                    "state_type": stype,
+                    "url": n.get("url"),
+                    "updatedAt": n.get("updatedAt"),
+                    "assignee_name": assignee.get("displayName") or assignee.get("name"),
+                    "_is_open": is_open,
+                    "_rank": rank,
+                }
+            )
+        # Open first, then Linear's relevance order; recency breaks any tie.
+        # (Stable sort: pre-order by recency, then by open-ness + relevance.)
+        ranked.sort(key=lambda r: r.get("updatedAt") or "", reverse=True)
+        ranked.sort(key=lambda r: (not r["_is_open"], r["_rank"]))
+        for r in ranked:
+            r.pop("_is_open", None)
+            r.pop("_rank", None)
+        out = ranked[: max(1, int(limit))]
+        log.info("[linear.find_issues_by_text] step 2/2: %d match(es)", len(out))
+        return out
