@@ -24,6 +24,10 @@ LINEAR_API_URL = "https://api.linear.app/graphql"
 
 # Linear priority: 0=no priority, 1=urgent, 2=high, 3=medium, 4=low.
 _PRIORITY_MAP = {"urgent": 1, "high": 2, "medium": 3, "low": 4}
+# Reverse: Linear priority Int → human label.
+_PRIORITY_LABEL = {0: "none", 1: "urgent", 2: "high", 3: "medium", 4: "low"}
+# Rank for "sort by priority" (urgent first, no-priority last). Lower = higher.
+_PRIORITY_SORT_RANK = {1: 0, 2: 1, 3: 2, 4: 3, 0: 4}
 
 # Closed set of label names the bot is allowed to apply.
 _ALLOWED_LABEL_NAMES = {"BE", "FE", "Feature", "Bug", "Improvement", "UI"}
@@ -116,14 +120,48 @@ query GetIssue($id: String!) {
     title
     description
     url
+    priority
+    estimate
+    dueDate
     createdAt
     updatedAt
     state { name type }
     labels { nodes { name } }
     assignee { displayName name email }
     creator { displayName name email }
+    cycle { number name }
+    project { name }
+    parent { identifier title }
+    children(first: 50) { nodes { identifier title } }
     comments(last: 1) {
       nodes { body createdAt user { displayName name } }
+    }
+  }
+}
+"""
+
+_ISSUE_HISTORY = """
+query IssueHistory($id: String!) {
+  issue(id: $id) {
+    identifier
+    history(first: 100) {
+      nodes {
+        id
+        createdAt
+        actor { displayName name }
+        fromState { name type }
+        toState { name type }
+        fromAssignee { displayName name }
+        toAssignee { displayName name }
+        fromPriority
+        toPriority
+        fromTitle
+        toTitle
+        fromDueDate
+        toDueDate
+        fromEstimate
+        toEstimate
+      }
     }
   }
 }
@@ -137,6 +175,8 @@ query ListIssues($filter: IssueFilter!, $first: Int!) {
       identifier
       title
       url
+      priority
+      dueDate
       createdAt
       updatedAt
       state { name type }
@@ -203,6 +243,24 @@ def _issue_node_to_dict(node: dict) -> dict:
     assignee = node.get("assignee") or {}
     creator = node.get("creator") or {}
     state = node.get("state") or {}
+
+    # Extra fields only `_GET_ISSUE` selects — absent (None) for list/search
+    # projections, which callers treat as "not loaded".
+    prio_raw = node.get("priority")
+    priority_label = _PRIORITY_LABEL.get(prio_raw) if prio_raw is not None else None
+    cycle = node.get("cycle") or None
+    if cycle:
+        cycle = {"number": cycle.get("number"), "name": cycle.get("name")}
+    project = (node.get("project") or {}).get("name")
+    parent = node.get("parent") or None
+    if parent:
+        parent = {"identifier": parent.get("identifier"), "title": parent.get("title")}
+    children = [
+        {"identifier": c.get("identifier"), "title": c.get("title")}
+        for c in (node.get("children") or {}).get("nodes") or []
+        if c and c.get("identifier")
+    ]
+
     return {
         "id": node.get("id"),
         "identifier": node.get("identifier"),
@@ -218,6 +276,14 @@ def _issue_node_to_dict(node: dict) -> dict:
         "assignee_email": assignee.get("email"),
         "creator": creator.get("displayName") or creator.get("name"),
         "creator_email": creator.get("email"),
+        "priority": priority_label,
+        "priority_value": prio_raw,
+        "estimate": node.get("estimate"),
+        "dueDate": node.get("dueDate"),
+        "cycle": cycle,
+        "project": project,
+        "parent": parent,
+        "children": children,
         "created_at": node.get("createdAt"),
         "updated_at": node.get("updatedAt"),
         "latest_comment": latest_comment,
@@ -838,4 +904,221 @@ class LinearClient:
             r.pop("_rank", None)
         out = ranked[: max(1, int(limit))]
         log.info("[linear.find_issues_by_text] step 2/2: %d match(es)", len(out))
+        return out
+
+    # -- engine-facing reads (tool-driven query mode) ------------------------
+
+    async def resolve_member_id(self, name: str) -> Optional[dict]:
+        """Fuzzy-resolve a free-text person `name` to ONE team member.
+
+        Returns {"id", "displayName"} on a single confident match, or a dict
+        {"error": "...", "candidates": [...]} when nothing/many match — never
+        raises. Matching is case-insensitive over displayName / name / email
+        local-part: exact (or first-name) wins; a substring match is the
+        fallback. Used by the query engine so a caller can filter by "Ravi"
+        without knowing the UUID."""
+        wanted = (name or "").strip().lower()
+        if not wanted:
+            return {"error": "empty name", "candidates": []}
+        try:
+            members = await self._get_team_members()
+        except Exception:
+            log.exception("[linear.resolve_member_id] members fetch failed")
+            return {"error": "could not load team members", "candidates": []}
+
+        exact: list[dict] = []
+        partial: list[dict] = []
+        for m in members:
+            fields = [
+                (m.get("displayName") or "").strip().lower(),
+                (m.get("name") or "").strip().lower(),
+            ]
+            email = (m.get("email") or "").strip().lower()
+            local = email.split("@", 1)[0] if email else ""
+            is_exact = False
+            for f in fields:
+                if not f:
+                    continue
+                if f == wanted or (f.split()[0] if f.split() else f) == wanted:
+                    is_exact = True
+                    break
+            if not is_exact and (email == wanted or local == wanted):
+                is_exact = True
+            if is_exact:
+                exact.append(m)
+                continue
+            if len(wanted) >= 2 and (
+                any(wanted in f for f in fields if f) or (local and wanted in local)
+            ):
+                partial.append(m)
+
+        matches = exact or partial
+        if len(matches) == 1:
+            hit = matches[0]
+            return {
+                "id": hit.get("id"),
+                "displayName": hit.get("displayName") or hit.get("name"),
+            }
+        cands = [
+            {"displayName": m.get("displayName") or m.get("name"), "email": m.get("email")}
+            for m in matches
+        ]
+        if not matches:
+            return {"error": f"no team member matches '{name}'", "candidates": []}
+        return {"error": f"'{name}' is ambiguous", "candidates": cands}
+
+    async def get_issue_history(self, id_or_identifier: str) -> list[dict]:
+        """Return the change history of one issue (state/assignee/priority/title/
+        due-date/estimate transitions) as compact events, oldest→newest:
+
+            {"at": iso, "actor": name, "changes": ["status: A → B", ...]}
+
+        This is the ONLY way to answer "when did the status change". Events with
+        no recognised change are dropped. Returns [] on error / not found or when
+        the issue has no history. Read-only, never raises."""
+        ident = str(id_or_identifier or "").strip()
+        log.info("[linear.get_issue_history] step 1/2: id=%r", ident)
+        if not ident:
+            return []
+        try:
+            data = await self._gql(_ISSUE_HISTORY, {"id": ident})
+        except Exception:
+            log.exception("[linear.get_issue_history] failed; returning []")
+            return []
+        issue = data.get("issue") or {}
+        nodes = (issue.get("history") or {}).get("nodes") or []
+
+        def _nm(v):
+            return (v or {}).get("displayName") or (v or {}).get("name") if v else None
+
+        events: list[dict] = []
+        for n in nodes:
+            if not n:
+                continue
+            changes: list[str] = []
+            fs, ts = _nm(n.get("fromState")), _nm(n.get("toState"))
+            if ts and ts != fs:
+                changes.append(f"status: {fs or '—'} → {ts}")
+            fa, ta = _nm(n.get("fromAssignee")), _nm(n.get("toAssignee"))
+            if (fa or ta) and fa != ta:
+                changes.append(f"assignee: {fa or 'unassigned'} → {ta or 'unassigned'}")
+            fp, tp = n.get("fromPriority"), n.get("toPriority")
+            if tp is not None and tp != fp:
+                changes.append(
+                    f"priority: {_PRIORITY_LABEL.get(fp, fp)} → {_PRIORITY_LABEL.get(tp, tp)}"
+                )
+            ftt, ttt = n.get("fromTitle"), n.get("toTitle")
+            if ttt and ttt != ftt:
+                changes.append("title changed")
+            fd, td = n.get("fromDueDate"), n.get("toDueDate")
+            if td != fd and (fd or td):
+                changes.append(f"due date: {fd or 'none'} → {td or 'none'}")
+            fe, te = n.get("fromEstimate"), n.get("toEstimate")
+            if te != fe and (fe is not None or te is not None):
+                changes.append(f"estimate: {fe if fe is not None else '—'} → {te if te is not None else '—'}")
+            if not changes:
+                continue
+            events.append(
+                {
+                    "at": n.get("createdAt"),
+                    "actor": _nm(n.get("actor")) or "unknown",
+                    "changes": changes,
+                }
+            )
+        events.sort(key=lambda e: e.get("at") or "")
+        log.info(
+            "[linear.get_issue_history] step 2/2: %s → %d change event(s)",
+            issue.get("identifier") or ident, len(events),
+        )
+        return events
+
+    async def list_issues_query(
+        self,
+        *,
+        assignee_id: Optional[str] = None,
+        label_names: Optional[list[str]] = None,
+        state_types: Optional[list[str]] = None,
+        created_after: Optional[str] = None,
+        updated_after: Optional[str] = None,
+        due_after: Optional[str] = None,
+        due_before: Optional[str] = None,
+        priority: Optional[str] = None,
+        order: str = "updatedAt",
+        limit: int = 20,
+    ) -> list[dict]:
+        """Flexible engine-facing issue list. All filters AND-ed and optional.
+
+        - state_types: subset of Linear workflow types {backlog, unstarted,
+          started, completed, canceled, triage}.
+        - priority: "urgent"|"high"|"medium"|"low"|"none".
+        - due_after/due_before: ISO dates (YYYY-MM-DD) bounding dueDate.
+        - order: "updatedAt" (default), "priority" (urgent first), or "dueDate"
+          (soonest first) — applied client-side after fetch.
+
+        Returns compact dicts (identifier, title, state, state_type, assignee,
+        priority, dueDate, updatedAt, url), [] on error. Read-only, never raises."""
+        f: dict = {"team": {"id": {"eq": self._team_id}}}
+        if assignee_id:
+            f["assignee"] = {"id": {"eq": assignee_id}}
+        if state_types:
+            f["state"] = {"type": {"in": list(state_types)}}
+        if label_names:
+            f["labels"] = {"some": {"name": {"in": list(label_names)}}}
+        if created_after:
+            f["createdAt"] = {"gte": created_after}
+        if updated_after:
+            f["updatedAt"] = {"gte": updated_after}
+        due: dict = {}
+        if due_after:
+            due["gte"] = due_after
+        if due_before:
+            due["lte"] = due_before
+        if due:
+            f["dueDate"] = due
+        if priority:
+            pv = _PRIORITY_MAP.get(str(priority).strip().lower())
+            if str(priority).strip().lower() == "none":
+                pv = 0
+            if pv is not None:
+                f["priority"] = {"eq": pv}
+
+        # Over-fetch a little so a client-side re-sort (priority/dueDate) still
+        # yields the top `limit` rather than the top `limit` by updatedAt.
+        fetch = min(100, max(int(limit), 20) * 2)
+        log.info(
+            "[linear.list_issues_query] step 1/2: filter=%s order=%s limit=%d",
+            f, order, limit,
+        )
+        try:
+            data = await self._gql(_LIST_ISSUES, {"filter": f, "first": fetch})
+        except Exception:
+            log.exception("[linear.list_issues_query] failed; returning []")
+            return []
+        nodes = (data.get("issues") or {}).get("nodes") or []
+        rows = [
+            {
+                "identifier": d.get("identifier"),
+                "title": d.get("title"),
+                "state": d.get("state"),
+                "state_type": d.get("state_type"),
+                "assignee": d.get("assignee"),
+                "priority": d.get("priority"),
+                "priority_value": d.get("priority_value"),
+                "dueDate": d.get("dueDate"),
+                "updatedAt": d.get("updated_at"),
+                "url": d.get("url"),
+            }
+            for d in (_issue_node_to_dict(n) for n in nodes if n)
+        ]
+
+        if order == "priority":
+            rows.sort(key=lambda r: _PRIORITY_SORT_RANK.get(r.get("priority_value"), 5))
+        elif order == "dueDate":
+            # Soonest first; issues with no due date sort to the end.
+            rows.sort(key=lambda r: r.get("dueDate") or "9999-12-31")
+        else:
+            rows.sort(key=lambda r: r.get("updatedAt") or "", reverse=True)
+
+        out = rows[: max(1, int(limit))]
+        log.info("[linear.list_issues_query] step 2/2: %d result(s)", len(out))
         return out

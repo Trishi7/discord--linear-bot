@@ -102,6 +102,66 @@ class DB:
                 "classification": json.loads(row["classification_json"]),
             }
 
+    def get_issue_for_message(self, message_id: int) -> Optional[dict]:
+        """Read-only: the stored Discord→Linear link for ONE message — the Linear
+        issue the bot created/updated from it. Returns {message_id, channel_id,
+        linear_issue_id, status, created_at} or None when the message wasn't
+        processed or isn't linked to an issue yet.
+
+        `linear_issue_id` is Linear's INTERNAL UUID (recorded at approval time),
+        not the human identifier — resolve it via Linear if you need "NFT2-123".
+        """
+        with self.conn() as c:
+            row = c.execute(
+                """
+                SELECT message_id, channel_id, linear_issue_id, status, created_at
+                FROM processed
+                WHERE message_id = ? AND linear_issue_id IS NOT NULL
+                """,
+                (str(message_id),),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "message_id": row["message_id"],
+                "channel_id": row["channel_id"],
+                "linear_issue_id": row["linear_issue_id"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+            }
+
+    def get_messages_for_issue(self, linear_issue_id: str) -> list[dict]:
+        """Read-only: every stored Discord message linked to a Linear issue,
+        matched on Linear's INTERNAL UUID (the id recorded at approval time).
+        Returns a list of {message_id, channel_id, linear_issue_id, status,
+        created_at}, newest first; [] when nothing links to it.
+
+        Identifier↔UUID resolution is the caller's job: the DB never sees the
+        "NFT2-123" identifier, so pass the internal id (get it from Linear).
+        """
+        if not linear_issue_id:
+            return []
+        with self.conn() as c:
+            rows = c.execute(
+                """
+                SELECT message_id, channel_id, linear_issue_id, status, created_at
+                FROM processed
+                WHERE linear_issue_id = ?
+                ORDER BY created_at DESC
+                """,
+                (str(linear_issue_id),),
+            ).fetchall()
+            return [
+                {
+                    "message_id": r["message_id"],
+                    "channel_id": r["channel_id"],
+                    "linear_issue_id": r["linear_issue_id"],
+                    "status": r["status"],
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ]
+
     def get_by_approval(self, approval_message_id: int) -> Optional[dict]:
         with self.conn() as c:
             row = c.execute(

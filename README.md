@@ -6,29 +6,52 @@ Linear: create a new issue, comment on an existing one (optionally with a
 status transition), or do nothing. Behind `REQUIRE_APPROVAL` the proposed
 action is gated on a ✅/❌ react in a private channel.
 
-Also exposes a **read-only QUERY MODE** when @-mentioned, with three intents:
+Also exposes a **read-only QUERY MODE** when @-mentioned. Linear questions are
+answered by a **tool-driven loop** (`query_engine.py`): the bot's own Claude call
+is handed a set of read-only Linear tools and decides which to call, so it answers
+open-ended questions — **due dates, status-change history, priority / estimate /
+cycle / sub-issues, sorted lists, "what changed"** — **without a handler per
+phrasing**. Discord-scoped questions ("what did Harsh post on discord") keep a
+dedicated Discord-history scan + identity-resolution path.
 
-- **`issue_status`** — a status check on **one specific issue**, by key
-  ("status of NFT-123") or by fuzzy description ("what's the status of the DMs
-  issue", "where are we on the payout bug").
-- **`person_activity`** — "what is `<person>` working on?", which merges a
-  person's **assigned/active Linear issues** with their **recent Discord
-  activity** from monitored channels into one synthesised reply.
-- **`issue_list`** — questions about Linear issues as a **group** ("list my open
-  bugs", "what's open with the Bug label", "issues Sid raised last week").
+Read-only Linear tools the engine can call:
+
+- **`search_issues`** — full-text search over **title + description + comments**
+  (acronym/synonym-aware — "DMs" and "direct messages" match the same issues).
+- **`get_issue`** — one issue in full: state, assignee, labels, priority,
+  estimate, dueDate, cycle, project, parent, sub-issues, latest comment.
+- **`get_issue_history`** — the status / assignee / priority / due-date change
+  timeline ("when did NFT2-610 change status").
+- **`list_issues`** — filter by assignee / labels / state type / created-after /
+  updated-after / due-date range / priority, sorted by `updatedAt`, `priority`,
+  or `dueDate`.
+- **`resolve_member` / `list_team_members`** — map a name to a Linear user.
+- **`source_message_for_issue` / `tracked_issue_for_message`** — Discord↔Linear
+  linking (see below).
 
 Two cross-cutting behaviours:
 
-- **Source scoping** — a question can be scoped to **Discord only**, **Linear
-  only**, or **both**. "what did Harsh post on discord" hits only Discord; "what
-  is Harsh assigned in Linear" hits only Linear; an unscoped question uses both.
-  A source-scoped reply never carries a section for the other source.
+- **Source scoping** — a question is scoped to **Discord**, **Linear**, or
+  **both**. `discord` questions ("what did Harsh post on discord") use the local
+  Discord scan; `linear` / `both` go to the tool-driven engine. A source-scoped
+  reply never carries a section for the other source.
 - **Edited messages re-trigger QUERY MODE only** — editing an @-mention question
   re-runs the query on the new text and posts a fresh reply; editing an ordinary
   message does nothing. Edits are **never** routed into the report/create path.
 
+**Discord ↔ Linear linking.** The bot stores a message→issue mapping for every
+issue it files/updates, and query mode can read it both ways: "which Discord
+message is behind NFT2-591" (`source_message_for_issue` — returns the originating
+message with author, timestamp, snippet, and a jump link) and, as a reply to a
+message, "is this already tracked?" (`tracked_issue_for_message`). **Limitation:**
+stored links only exist for issues **the bot itself created or updated** — for an
+issue filed manually in Linear the engine says so plainly rather than guessing;
+there is no heuristic message-matching (if added later, such matches would be
+clearly labelled "possible match", not a stored link).
+
 Query mode (and edit-handling) is **strictly read-only** — no create / comment /
-status change, ever.
+status change, ever — and the tool loop is capped at **5 iterations** (then it
+answers with whatever it has gathered).
 
 ## Why a human-in-the-loop step?
 
@@ -50,17 +73,19 @@ Discord ──▶ Pre-filter ──▶ LLM classifier ──▶ Plan ──▶ A
                                                       message→issue mapping)
 
             ┌─────────────────── QUERY MODE (read-only) ───────────────┐
-@mention  ──▶ parse_query (LLM) ──┬─ issue_status ──▶ get_issue (by key) or
- or EDIT of    → intent + source  │                   find_issues_by_text (fuzzy)
- an @mention     + subject/labels │                     ├─ 1 match  ──▶ reply
-                                  │                     ├─ 2–5      ──▶ ask which
-                                  │                     └─ 0        ──▶ honest miss
-                                  ├─ person_activity ──▶ resolve_person
-                                  │    (source: discord | linear | both)
-                                  │    ├─ Linear:  active_issues_for_user
-                                  │    └─ Discord: scan_recent_messages
-                                  │          └─▶ LLM synthesis ──▶ reply
-                                  └─ issue_list ──▶ list/get/search ──▶ reply
+@mention  ──▶ parse_query (LLM) ──┬─ source=discord ──▶ resolve_person
+ or EDIT of    → is_query+source  │                     + scan_recent_messages
+ an @mention                      │                     └─▶ LLM synthesis ──▶ reply
+                                  │
+                                  └─ source=linear|both ──▶ QUERY ENGINE
+                                       (tool-use loop, ≤5 iterations)
+                                       model ⇄ read-only Linear tools:
+                                         search_issues · get_issue ·
+                                         get_issue_history · list_issues ·
+                                         resolve_member · list_team_members ·
+                                         source_message_for_issue ·
+                                         tracked_issue_for_message
+                                       └─▶ final text ──▶ reply
 ```
 
 ## Project layout
@@ -72,9 +97,10 @@ discord-linear-bot/
 ├── .env.example
 ├── main.py             # entry point
 ├── config.py           # env loading + allowlist parsing
-├── db.py               # SQLite state store
-├── classifier.py       # report classifier + query parser + activity synthesiser
-├── linear_client.py    # Linear GraphQL client (labels, states, members, issues, comments)
+├── db.py               # SQLite state store (+ read-only message↔issue linkage)
+├── classifier.py       # report classifier + query router (parse_query) + activity synthesiser
+├── linear_client.py    # Linear GraphQL client (labels, states, members, issues, history, comments)
+├── query_engine.py     # tool-driven read-only Linear query engine (tool-use loop)
 ├── query.py            # read-only person resolution + Discord activity scan
 └── bot.py              # Discord bot: on_message, on_raw_message_edit, on_raw_reaction_add, query mode
 ```
@@ -225,126 +251,127 @@ title only and shouldn't assume the issue's progress changed).
 ## Query mode (read-only)
 
 @-mention the bot in a monitored channel **or** the approval channel with a
-question. A **separate** LLM call (`classifier.parse_query`, strict JSON)
-classifies it into one of three intents (`issue_status`, `person_activity`,
-`issue_list`) and also emits a **`source`** (`discord` | `linear` | `both`) plus
-an optional **category** (`labels`, e.g. `Bug`).
+question. A lightweight LLM call (`classifier.parse_query`) decides two things:
+is this a question at all (`is_query`), and its **`source`** scope
+(`discord` | `linear` | `both`). Routing then follows the source:
+
+- **`source = discord`** → the local Discord path: `query.resolve_person` +
+  `scan_recent_messages` + LLM synthesis (*person activity*, below). Linear is
+  never touched.
+- **`source = linear` or `both`** → the **tool-driven query engine**
+  (`query_engine.py`).
+
+### The tool-driven engine (`linear` / `both`)
+
+Instead of a handler per phrasing, the engine runs a **tool-use loop**: the bot's
+own Claude call is given the read-only Linear tools plus the question, calls
+whichever tools it needs, feeds the results back, and repeats until it has an
+answer — capped at **5 tool iterations** (then it answers with what it has). It is
+instructed to call tools rather than guess, prefer an explicit issue key when one
+is given, say plainly when nothing matches, never invent issues/fields/links, and
+keep replies Discord-short.
+
+| Tool | Answers |
+|------|---------|
+| `search_issues(text, include_closed)` | subject lookups — full-text over title + description + comments |
+| `get_issue(identifier)` | one issue in full — state, assignee, labels, priority, estimate, dueDate, cycle, project, parent, sub-issues, latest comment |
+| `get_issue_history(identifier)` | "when did status change" / "what changed" — the change timeline with actor + timestamp |
+| `list_issues(...)` | filtered lists — assignee / labels / state type / created-after / updated-after / due-date range / priority, sorted by `updatedAt` · `priority` · `dueDate` |
+| `resolve_member(name)` / `list_team_members()` | name → Linear user id |
+| `source_message_for_issue(identifier)` | originating Discord message(s) for a bot-tracked issue |
+| `tracked_issue_for_message(message)` | the Linear issue filed/updated from a Discord message |
+
+Questions it now handles with no new code:
+
+```
+@TriageBot status of DMs
+@TriageBot when did NFT2-610 change status
+@TriageBot what's due this week
+@TriageBot what's assigned to Ravi sorted by priority
+@TriageBot which discord message is behind NFT2-591
+```
+
+> **Matching spans more than titles.** `search_issues` uses Linear's `searchIssues`
+> full-text index (title + description + comments), acronym/synonym-aware, so "DMs"
+> and "direct messages" surface the same issues.
+>
+> **State-type quirk (this workspace).** "awaiting QA" and "Done" are typed
+> `completed`; the engine keeps `include_closed=true` for status/subject lookups so
+> live-but-technically-completed work still surfaces, and reports each issue by its
+> literal state name rather than calling it "closed".
+
+### Discord ↔ Linear linking
+
+`db.py` stores a Discord-message-id → Linear-issue-UUID mapping for every issue the
+bot files/updates; query mode reads it both ways:
+
+- **`source_message_for_issue(NFT2-591)`** → the originating message(s): author,
+  timestamp, a text snippet, and a reconstructed jump link
+  (`https://discord.com/channels/<guild>/<channel>/<msg>`). A deleted/unreadable
+  message degrades to a note, never an error.
+- **`tracked_issue_for_message(...)`** → given a message id / jump link, or (as a
+  reply) the replied-to message, the issue the bot filed from it — or
+  `tracked: false`.
+
+The engine replies with the **issue and the Discord jump link together**.
+**Limitation:** links exist only for issues **the bot itself created or updated**
+(the create / comment flows that reached approval); for a manually-filed issue the
+engine says there's no stored link rather than guessing. There is **no heuristic
+message-matching** — if added later, such matches would be labelled "possible
+match", never presented as a stored link.
 
 ### Source scoping (`discord` / `linear` / `both`)
 
-The parser infers *which system* a question is about, so a source-scoped reply
-only ever touches — and only ever shows — that source:
+`parse_query` infers which system a question is about; a source-scoped reply only
+touches — and only shows — that source:
 
-| Phrasing cues                                             | `source`  | Effect |
-|----------------------------------------------------------|-----------|--------|
-| "on discord", "in the channel", "posted", "mentioned/said" | `discord` | Discord scan only; **no** Linear section |
-| "in linear", "assigned to", "ticket", "issue", "status of" | `linear`  | Linear lookup only; **no** Discord section |
-| no explicit source                                        | `both`    | combined (previous behaviour) |
-
-```
-@TriageBot what bugs did Harsh mention on discord today   → discord-only, Bug-filtered
-@TriageBot what is Harsh assigned in linear               → linear-only
-@TriageBot what is Harsh working on                       → both
-```
-
-A **Discord-scoped `issue_list`** ("what bugs did Harsh mention on discord") is
-*not* a Linear query — it's redirected to the Discord activity path so Linear is
-never queried for it. The reply header always reflects the source(s) actually
-used.
-
-### `issue_status` — one specific issue, by key or description
+| Phrasing cues                                              | `source`  | Route |
+|------------------------------------------------------------|-----------|-------|
+| "on discord", "in the channel", "posted", "mentioned/said" | `discord` | Discord scan only |
+| "in linear", "assigned to", "ticket", "issue", "status of" | `linear`  | query engine |
+| no explicit source                                         | `both`    | query engine |
 
 ```
-@TriageBot status of NFT-123
-@TriageBot what's the status of the DMs issue
-@TriageBot where are we on the payout bug
-@TriageBot tell me the description of NFT-610
-@TriageBot tell me more about NFT-610
+@TriageBot what bugs did Harsh mention on discord today   → discord scan, Bug-filtered
+@TriageBot what is Harsh assigned in linear               → engine (Linear)
+@TriageBot what is Harsh working on                       → engine (Linear)
 ```
 
-**Detail level.** The query parser sets `detail` per phrasing: `"description"`
-("description of NFT-123", "what does NFT-123 say") **leads with the full issue
-description**; `"more"` ("tell me more about / details of NFT-123") shows the
-description **under** the summary; `"none"` (a plain status check) keeps the
-one-line summary + latest comment. The description is pulled from Linear (now
-SELECTed in `get_issue`), truncated to ~1500 chars — and further if needed to fit
-Discord's message ceiling — with a "…(full text in Linear)" pointer + URL so it's
-never silently dropped. An empty description is reported as "(no description set)".
+> **Note.** An unscoped person question ("what is Sid working on") parses as `both`
+> and is answered by the engine from **Linear**. The blended Discord-activity
+> summary is produced only for `discord`-scoped person questions (below).
 
-Flow (`bot._handle_issue_status`):
-
-- **Explicit key** (e.g. `NFT-123`) → `get_issue` directly; reply with title,
-  status, assignee, link, and latest comment. Missing key → honest "couldn't
-  find **NFT-123**".
-- **Free-text subject** → `linear_client.find_issues_by_text(subject)`, which
-  returns **all** open matches (open issues first, ranked by relevance then
-  recency):
-  - **exactly one match** (and no "list them all" phrasing) → full status answer
-    (re-fetched for the latest comment),
-  - **several matches, or phrasing that asks for all of them** ("all issues
-    containing DMs", "list the DM tickets") → the bot **lists every match**
-    (identifier + current status + title), capped at 10 with a "showing N of M"
-    note; it no longer forces a disambiguation question,
-  - **no match** → says plainly that no *open* issue matched "`<subject>`", names
-    what was searched, and offers to widen to closed issues.
-
-> **Note — matching spans more than titles.** `find_issues_by_text` uses Linear's
-> `searchIssues` full-text index (title + description + comments) and is
-> acronym/synonym-aware, so **both "DMs" and "direct messages" surface the same
-> direct-message issues** without the bot maintaining its own alias table. Quality
-> still tracks how issues are worded, but is not limited to the exact title.
-
-### `issue_list` — questions about Linear issues
+### `person_activity` (Discord-scoped) — "what did `<person>` post?"
 
 ```
-@TriageBot status of NFT-123
-@TriageBot list the issues I raised in the last 2 weeks and their statuses
-@TriageBot what's open with the Bug label
-@TriageBot any open BE bugs
+@TriageBot what did Harsh post on discord this week
+@TriageBot what has Sid been saying in the channels
+@TriageBot what bugs did Harsh mention on discord
 ```
 
-Parsed into a filter spec — reporter / time window (`window_days`) / labels /
-states / free text — then fetched via `linear_client.get_issue` / `list_issues`
-/ `search_issues` and replied to in the same channel.
+Used for **`source = discord`** questions. Flow (`bot._handle_person_activity`):
 
-### `person_activity` — "what is `<person>` working on?"
-
-```
-@TriageBot what is Sid working on?
-@TriageBot what's Harsh been up to this week?
-@TriageBot what am I working on?
-```
-
-Flow (`bot._handle_person_activity`):
-
-1. **`query.resolve_person(name)`** maps the free-text name to **both** a Linear
-   user (matched against `list_team_members` by displayName / name / email, with
-   first-name / partial fallback) and a Discord user (via `DISCORD_LINEAR_MAP`
+1. **`query.resolve_person(name)`** maps the free-text name to a Linear user
+   (matched against `list_team_members` by displayName / name / email, with
+   first-name / partial fallback) **and** a Discord user (via `DISCORD_LINEAR_MAP`
    when the Linear user is mapped, else display-name match against recent posters
-   / guild members).
-   - **Ambiguous** (several plausible matches) → the bot replies asking which
-     person and does nothing else — it never guesses.
-   - **No match** in either system → it says so plainly.
-2. **Linear side** — `active_issues_for_user(linear_user.id, now − window)`:
-   issues assigned to them that are in a `started`-type state **or** were updated
-   within the window.
-3. **Discord side** — `scan_recent_messages(...)` walks `channel.history` across
-   monitored channels only, matching by Discord ID (preferred) or display name.
-4. **Synthesis** — the in-scope result sets are handed to
-   `classifier.summarize_person_activity`, which writes one concise reply. Under
-   `source="both"` that's a **Working on (Linear)** list (identifier, title,
-   status, link) *and* a 1–3 sentence **Recent Discord activity** summary with
-   jump links. Under a scoped `source` **only that one section is produced** —
-   the out-of-scope data is never even sent to the model, so a Discord-only
-   answer can't leak a Linear block (and vice versa). A `category` (e.g. `Bug`)
-   narrows both sides — Linear issues are label-filtered, the Discord summary is
-   biased to matching messages. The model **summarises** Discord — it must not
-   dump raw logs or invent issues/links; an empty source is "nothing in
-   `<source>`". If the synthesis call fails, a source-aware deterministic
-   fallback render is used instead.
+   / guild members). This shared identity layer is also what lets the engine's
+   linking tools line up the right person.
+   - **Ambiguous** (several plausible matches) → the bot asks which person and
+     does nothing else — it never guesses.
+   - **No match** → it says so plainly.
+2. **Discord scan** — `scan_recent_messages(...)` walks `channel.history` across
+   monitored channels only, matching by Discord ID (preferred) or display name,
+   bounded by the lookback window and per-channel cap.
+3. **Synthesis** — `classifier.summarize_person_activity` writes one concise
+   **Recent Discord activity** summary (1–3 sentences + jump links to the most
+   relevant messages). A `category` (e.g. `Bug`) biases it to matching messages.
+   The model **summarises** — it never dumps raw logs or invents links; an empty
+   scan is "nothing in Discord". On failure a deterministic fallback render is used.
 
 The window defaults to `QUERY_DISCORD_LOOKBACK_DAYS` when the question gives no
-time frame.
+time frame. A person's **Linear** assignments are answered by the engine instead
+(ask "what is `<person>` assigned in linear").
 
 ### Environment knobs (person_activity)
 
@@ -382,15 +409,19 @@ Editing a message re-runs **only** query mode — never the report path
   → **nothing happens**. An edited bug report never creates a second ticket and
   never touches the create/comment/status pipeline.
 
-### Hard guarantees (all intents)
+### Hard guarantees
 
-- Query mode — including edit re-triggers — is **read-only**. It never calls
-  `create_issue`, `add_comment`, or `set_issue_status`.
-- Query mode runs **before** the report pipeline, so a question can never
-  become a ticket; edits are never routed into the report pipeline at all.
-- A source-scoped answer never shows a section for the other source.
-- `issue_status` never replies with a bare null — every branch (hit, ambiguous,
-  miss, bad input) produces a useful message.
+- Query mode — including edit re-triggers — is **read-only**. The engine is only
+  ever given read tools; it never calls `create_issue`, `add_comment`, or
+  `set_issue_status`, by construction.
+- The engine tool loop is **bounded** (≤5 iterations); on the cap it answers with
+  what it has rather than looping forever.
+- Query mode runs **before** the report pipeline, so a question can never become a
+  ticket; edits are never routed into the report pipeline at all.
+- Tool errors are handled **inside** the loop (fed back as an error result), so a
+  failed Linear read never crashes the reply — the model recovers or reports it.
+- The engine is told never to invent issues, identifiers, links, or fields, and to
+  say plainly when nothing matches.
 - Reply-pings don't trigger queries — only explicit `<@bot_id>` mentions do.
 - Anyone in the channel can query (no reporter allowlist for queries).
 
@@ -403,21 +434,31 @@ with a help nudge instead of dropping silently.
 
 Clean module roles:
 
-- **`classifier.py`** — `Anthropic`-backed text/JSON producer. Three prompts:
-  report classifier, query parser, and the `person_activity` synthesiser
-  (`summarize_person_activity`). **Never** touches Linear or Discord.
+- **`classifier.py`** — `Anthropic`-backed text/JSON producer. Prompts: report
+  classifier, query **router** (`parse_query` → `is_query` + `source`), and the
+  `person_activity` synthesiser (`summarize_person_activity`). **Never** touches
+  Linear or Discord.
+- **`query_engine.py`** — the tool-driven query engine: `Anthropic` tool-use loop
+  over a set of read-only Linear tools (`search_issues`, `get_issue`,
+  `get_issue_history`, `list_issues`, `resolve_member`, `list_team_members`), plus
+  per-call `extra_tools` injected by `bot.py` for Discord↔Linear linking. Capped at
+  5 iterations; read-only by construction.
 - **`linear_client.py`** — all Linear reads/writes over GraphQL. No Linear MCP.
-  Helpers: `resolve_label_ids`, `resolve_assignee`, `create_issue`,
-  `add_comment`, `set_issue_status`, `list_team_states`, `search_issues`,
-  `find_issues_by_text` (fuzzy title/keyword lookup for `issue_status`),
-  `get_issue`, `list_issues`, plus the query-mode reads `list_team_members`,
-  `active_issues_for_user` (optionally label-filtered), `recent_issues_created_by`.
-- **`query.py`** — read-only building blocks for `person_activity`:
+  Write/report helpers: `resolve_label_ids`, `resolve_assignee`, `create_issue`,
+  `add_comment`, `set_issue_status`, `list_team_states`. Query-mode reads:
+  `search_issues` / `find_issues_by_text` (full-text lookup), `get_issue` (full
+  fields), `get_issue_history` (change timeline), `list_issues` /
+  `list_issues_query` (flexible filter + sort), `resolve_member_id`,
+  `list_team_members`, `active_issues_for_user`.
+- **`query.py`** — read-only building blocks for the Discord-scoped path:
   `scan_recent_messages` (Discord history scan over monitored channels) and
   `resolve_person` (free-text name → Linear user + Discord user). Takes the
   Linear client and Discord client as parameters; never mutates either.
+- **`db.py`** — SQLite state + the read-only `get_issue_for_message` /
+  `get_messages_for_issue` linkage lookups the linking tools build on.
 - **`bot.py`** — orchestrates Discord events, decides plans, posts embeds,
-  handles ✅/❌, runs query mode, persists state via `db.py`.
+  handles ✅/❌, routes query mode (Discord scan vs engine), builds the linking
+  tools, persists state via `db.py`.
 
 ## Setup
 
@@ -489,11 +530,15 @@ See `.env.example` for the full list with comments. Key knobs:
   mode covers most query needs via @-mention.
 - **Embedding-based duplicate detection** — current dedup is title-equality on
   open issues. Worthwhile v2 with `voyage-3` or similar.
-- **Custom synonym/alias map** — `issue_status` fuzzy search already leans on
+- **Custom synonym/alias map** — the engine's `search_issues` already leans on
   Linear's full-text index (title + description + comments), which is
   acronym/synonym-aware (DMs ↔ "direct messages" resolves today). A bot-side alias
   map for domain jargon Linear's index *doesn't* connect would be a further step,
   but isn't needed for the common cases.
+- **Heuristic issue↔message correlation** — linking is stored-mapping only (issues
+  the bot filed/updated). Correlating an arbitrary Linear issue to recent Discord
+  messages by keyword — clearly labelled "possible match" — is a deliberate
+  non-goal for now; it would add a noisier content scan to the loop.
 - **Per-channel category overrides** — easy to add in `bot._decide_plan`.
 - **Metrics** — add Prometheus counters around classified / approved /
   rejected / commented / dup-matched.

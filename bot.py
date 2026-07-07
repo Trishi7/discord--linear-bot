@@ -13,7 +13,6 @@ posted to the same channel instead.
 """
 import asyncio
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -24,6 +23,7 @@ import query
 from classifier import Classifier
 from db import DB
 from linear_client import LinearClient, LinearError
+from query_engine import QueryEngine
 
 log = logging.getLogger(__name__)
 
@@ -56,33 +56,8 @@ _SIGNAL_HUMAN = {
 # Linear workflow state TYPEs we consider "open" for duplicate detection.
 _OPEN_STATE_TYPES = {"backlog", "unstarted", "started", "triage"}
 
-# Query-mode mapping from a coarse state token (parsed `states[]`) to the set of
-# Linear workflow state TYPEs to filter by. Unioned across the requested tokens
-# by `_state_types_for`; an empty result means "no state filter".
-_QUERY_STATE_TYPES = {
-    "open": ["backlog", "unstarted", "started", "triage"],
-    "closed": ["completed", "canceled"],
-    "in_progress": ["started"],
-    "done": ["completed"],
-    "cancelled": ["canceled"],
-}
-
-# Cap on how many issues we list in a single query-mode reply.
+# Cap on how many issues the Discord person-activity fallback render lists.
 QUERY_LIST_LIMIT = 10
-
-# Discord single-message ceiling we render within (matches `_safe_reply`'s clip).
-# When an issue description is requested we budget against this so the "full text
-# in Linear" pointer always survives rather than being silently clipped away.
-DISCORD_REPLY_BUDGET = 1900
-# Hard cap on how much raw Linear description we inline before pointing to Linear.
-DESCRIPTION_MAX_CHARS = 1500
-
-# Phrasing that asks an issue_status question to enumerate EVERY matching issue
-# ("all issues containing DMs", "list the DM tickets") rather than pinpoint one.
-# When this matches we list matches instead of answering as a single issue.
-_WANTS_ALL_MATCHES_RE = re.compile(
-    r"\b(all|list|every|each|both|which\s+ones|what\s+are\s+the)\b", re.IGNORECASE
-)
 
 # Cap on how far we walk the reply chain / how much channel history we scan
 # when gathering messages associated with one.
@@ -208,6 +183,10 @@ class TriageBot(discord.Client):
         self.classifier = Classifier(config.ANTHROPIC_API_KEY, config.CLASSIFIER_MODEL)
         log.info("[bot.init] Constructing LinearClient (team=%s)", config.LINEAR_TEAM_ID)
         self.linear = LinearClient(config.LINEAR_API_KEY, config.LINEAR_TEAM_ID)
+        log.info("[bot.init] Constructing QueryEngine (model=%s)", config.CLASSIFIER_MODEL)
+        self.query_engine = QueryEngine(
+            config.ANTHROPIC_API_KEY, config.CLASSIFIER_MODEL, self.linear
+        )
         log.info(
             "[bot.init] TriageBot ready (require_approval=%s, allowlist: %d ids + %d names)",
             config.REQUIRE_APPROVAL,
@@ -1299,15 +1278,19 @@ class TriageBot(discord.Client):
             log.exception("[query] reply failed")
 
     async def _handle_query(self, message: discord.Message) -> bool:
-        """Handle an @-mention as a question — either "what is <person> working
-        on?" (person_activity) or an issue list/lookup (issue_list).
+        """Handle an @-mention as a question.
+
+        `parse_query` classifies the question and, crucially, its `source`
+        scope. Discord-scoped questions ("what did Harsh post") keep the local
+        scan + identity-resolution path; anything touching Linear is handed to
+        the read-only tool-driven `QueryEngine`, which chooses its own Linear
+        reads (get_issue / get_issue_history / list_issues / search_issues /
+        list_team_members).
 
         Returns True if the message was handled (replied to) as a query;
         False if it didn't read like a question and the report pipeline should
-        be given a chance instead. READ-ONLY throughout — only reads from Linear
-        (get_issue / list_issues / search_issues / active_issues_for_user /
-        list_team_members) and Discord history; never creates, comments, or
-        modifies anything.
+        be given a chance instead. READ-ONLY throughout — never creates,
+        comments, or modifies anything.
         """
         log.info(
             "[query] step 1/4: msg=%s author=%s(%s) channel=#%s",
@@ -1345,277 +1328,265 @@ class TriageBot(discord.Client):
             return False
 
         intent = parsed.get("intent")
-        log.info("[query] step 3/4: intent=%s parsed=%s", intent, parsed)
-
-        if intent == "person_activity":
-            await self._handle_person_activity(message, parsed)
-            log.info("[query] DONE msg=%s (person_activity)", message.id)
-            return True
-
-        if intent == "issue_status":
-            await self._handle_issue_status(message, parsed)
-            log.info("[query] DONE msg=%s (issue_status)", message.id)
-            return True
-
-        if intent == "issue_list":
-            await self._handle_issue_list(message, parsed)
-            log.info("[query] DONE msg=%s (issue_list)", message.id)
-            return True
-
-        # is_query=true but no actionable intent — treat as not-a-query so the
-        # report pipeline (in a monitored channel) can have a go.
-        log.info("[query] intent %r not actionable; letting report path try", intent)
-        return False
-
-    # -- query mode: issue_status (read-only) ----------------------------
-
-    async def _handle_issue_status(
-        self, message: discord.Message, parsed: dict
-    ) -> None:
-        """Answer "what's the status of X?" for ONE issue — by explicit key if
-        given, otherwise by fuzzy subject search. Every branch replies with a
-        useful message (never a bare null). Read-only — only reads from Linear.
-        """
-        identifier = (parsed.get("identifier") or "").strip()
-        subject = (parsed.get("subject") or parsed.get("search_term") or "").strip()
-        # "none" | "more" | "description" — how much of the issue body to show.
-        detail = (parsed.get("detail") or "none").strip().lower()
-        if detail not in ("none", "more", "description"):
-            detail = "none"
-
-        # 1) Explicit key wins — fetch directly, no search.
-        if identifier:
-            log.info("[query.issue_status] identifier=%r detail=%s → get_issue", identifier, detail)
-            try:
-                issue = await self.linear.get_issue(identifier)
-            except Exception:
-                log.exception("[query.issue_status] get_issue raised")
-                issue = None
-            if issue:
-                await self._safe_reply(message, self._format_single_issue(issue, detail=detail))
-            else:
-                await self._safe_reply(
-                    message, f"I couldn't find issue **{identifier}** in Linear."
-                )
-            return
-
-        # 2) No key — need a subject to search on.
-        if not subject:
-            await self._safe_reply(
-                message,
-                "Which issue do you mean? Give me its key (e.g. `NFT-123`) or a few "
-                "words from its title (e.g. `status of the payout bug`).",
-            )
-            return
-
-        log.info("[query.issue_status] subject=%r → find_issues_by_text", subject)
-        try:
-            matches = await self.linear.find_issues_by_text(subject, include_closed=False)
-        except Exception:
-            log.exception("[query.issue_status] find_issues_by_text raised")
-            await self._safe_reply(
-                message, "⚠️ Sorry — Linear search failed. See bot logs."
-            )
-            return
-
-        # 2a) Nothing open matched — be honest, name what was searched, offer closed.
-        if not matches:
-            await self._safe_reply(
-                message,
-                f'No **open** Linear issue matched "{subject}" — I searched issue '
-                f"title keywords. It may be closed or titled differently. Want me to "
-                f"include closed issues, or try different words?",
-            )
-            return
-
-        # Did the asker want the WHOLE set ("all issues containing DMs", "list
-        # the DM tickets")? Check the raw question and the parsed subject.
-        wants_all = bool(
-            _WANTS_ALL_MATCHES_RE.search(self._strip_self_mention(message.content))
-            or _WANTS_ALL_MATCHES_RE.search(subject)
-        )
-
-        # 2b) Exactly one match and no "list them all" phrasing — answer fully
-        # (fetch details so we can show the latest comment).
-        if len(matches) == 1 and not wants_all:
-            top = matches[0]
-            issue = None
-            ident = top.get("identifier")
-            if ident:
-                try:
-                    issue = await self.linear.get_issue(ident)
-                except Exception:
-                    log.exception("[query.issue_status] detail fetch raised; using search hit")
-            await self._safe_reply(
-                message,
-                self._format_single_issue(issue, detail=detail) if issue
-                else self._format_single_issue(self._match_to_issue(top), detail=detail),
-            )
-            return
-
-        # 2c) Several matches (or an explicit "list them all") — enumerate every
-        # match with its current status. We don't force a disambiguation question.
-        log.info(
-            "[query.issue_status] listing %d match(es) (wants_all=%s)",
-            len(matches), wants_all,
-        )
-        await self._safe_reply(
-            message, self._format_status_matches(subject, matches)
-        )
-
-    @staticmethod
-    def _match_to_issue(m: dict) -> dict:
-        """Map a find_issues_by_text hit onto the _format_single_issue shape."""
-        return {
-            "identifier": m.get("identifier"),
-            "title": m.get("title"),
-            "state": m.get("state_name"),
-            "url": m.get("url"),
-            "assignee": m.get("assignee_name"),
-            "labels": [],
-            "latest_comment": None,
-        }
-
-    def _format_status_matches(self, subject: str, matches: list[dict]) -> str:
-        """List every open issue matching `subject`, each with its identifier,
-        title, and current status. Used when a status question matches several
-        issues (or explicitly asks for all of them) — no disambiguation prompt."""
-        total = len(matches)
-        shown = matches[:QUERY_LIST_LIMIT]
-        header = f'**{total}** open issue(s) match "{subject}":'
-        lines = [header]
-        for m in shown:
-            ident = m.get("identifier") or "?"
-            title = (m.get("title") or "(untitled)").strip()
-            if len(title) > 80:
-                title = title[:77] + "…"
-            state = m.get("state_name") or "?"
-            url = m.get("url") or ""
-            link = f"[{ident}]({url})" if url else ident
-            lines.append(f"• {link} — _{state}_ — {title}")
-        if total > len(shown):
-            lines.append(f"_(showing {len(shown)} of {total} — narrow the wording to trim.)_")
-        lines.append("_Ask about any identifier (e.g. NFT-123) for the full detail + latest comment._")
-        return "\n".join(lines)
-
-    # -- query mode: issue_list (read-only) ------------------------------
-
-    async def _handle_issue_list(self, message: discord.Message, parsed: dict) -> None:
-        """reporter / date / label / state → issues, or a single-identifier
-        lookup. Read-only.
-
-        A Discord-scoped issue question ("what bugs did Harsh mention on
-        discord") is NOT a Linear query — it's a request to summarise Discord.
-        Redirect those to the person_activity Discord path so we never hit
-        Linear for them."""
         source = (parsed.get("source") or "both").strip().lower()
+        if source not in ("discord", "linear", "both"):
+            source = "both"
+        log.info("[query] step 3/4: intent=%s source=%s parsed=%s", intent, source, parsed)
+
+        # ROUTING — Discord-scoped questions keep the existing Discord scan +
+        # identity-resolution path (person activity from monitored-channel
+        # history). Everything that touches Linear — issue status, issue lists,
+        # AND the Linear side of a person question — now flows through the
+        # tool-driven engine, which decides for itself which read-only Linear
+        # tools to call. No more per-intent Linear handlers.
         if source == "discord":
-            reporter = (parsed.get("reporter") or "").strip()
-            search_term = (parsed.get("search_term") or "").strip()
-            person = reporter or search_term
-            if not person:
-                await self._safe_reply(
-                    message,
-                    "That looks like a Discord question — tell me *whose* messages "
-                    "to summarise (e.g. `what bugs did Harsh mention on discord`).",
-                )
-                log.info("[query.issue_list] discord-scoped but no person; asked for one")
-                return
-            log.info("[query.issue_list] discord-scoped → person_activity(discord) person=%r", person)
+            person = (
+                parsed.get("person")
+                or parsed.get("reporter")
+                or parsed.get("search_term")
+                or ""
+            ).strip()
             await self._handle_person_activity(
                 message,
                 {**parsed, "intent": "person_activity", "source": "discord", "person": person},
             )
-            return
+            log.info("[query] DONE msg=%s (discord scan)", message.id)
+            return True
 
-        log.info("[query.issue_list] step 4/4: running against Linear")
+        # source == "linear" or "both" → tool-driven Linear engine.
+        await self._handle_linear_engine_query(message, text)
+        log.info("[query] DONE msg=%s (engine)", message.id)
+        return True
+
+    async def _handle_linear_engine_query(
+        self, message: discord.Message, text: str
+    ) -> None:
+        """Answer a Linear-oriented question via the read-only tool-use engine.
+
+        Best-effort resolves the asker to a Linear user id up front so the engine
+        can honour "my"/"me" without a round-trip. READ-ONLY — the engine only
+        holds read tools, so this can never create/comment/modify anything."""
+        requester_name = _display(message.author)
+        requester_linear_id: Optional[str] = None
         try:
-            issues, single = await self._run_issue_list_query(
-                parsed, requester=message.author
+            requester_linear_id = await self.linear.resolve_assignee(
+                discord_user_id=getattr(message.author, "id", 0),
+                display_name=requester_name,
+                discord_linear_map=config.DISCORD_LINEAR_MAP,
             )
         except Exception:
-            log.exception("[query.issue_list] raised; replying with error")
-            await self._safe_reply(message, "⚠️ Sorry — Linear lookup failed. See bot logs.")
-            return
+            log.exception("[query.engine] requester resolution raised; continuing without id")
 
-        if single:
-            reply = (
-                self._format_single_issue(issues[0])
-                if issues
-                else "_(no matching Linear issue)_"
+        log.info(
+            "[query.engine] msg=%s requester=%s linear_id=%s q=%r",
+            message.id, requester_name, requester_linear_id, text[:160],
+        )
+        try:
+            reply = await self.query_engine.answer(
+                question=text,
+                requester_name=requester_name,
+                requester_linear_id=requester_linear_id,
+                extra_tools=self._linking_tools(message),
             )
-        else:
-            reply = self._format_issue_list(issues)
+        except Exception:
+            log.exception("[query.engine] answer raised")
+            reply = None
+
+        if not reply:
+            reply = (
+                "I couldn't find an answer to that in Linear. Try an issue key "
+                "(e.g. `NFT2-123`), a subject (`status of the DMs issue`), or a "
+                "filter (`open bugs assigned to Ravi`)."
+            )
         await self._safe_reply(message, reply)
 
-    async def _run_issue_list_query(
-        self, parsed: dict, *, requester: discord.User
-    ) -> tuple[list[dict], bool]:
-        """Translate an issue_list query into get_issue / list_issues /
-        search_issues. Returns (issues, is_single_lookup). Read-only."""
-        identifier = (parsed.get("identifier") or "").strip()
-        if identifier:
-            issue = await self.linear.get_issue(identifier)
-            return ([issue] if issue else []), True
+    # -- query mode: Discord ↔ Linear linking (read-only) ----------------
 
-        # Resolve "reporter" to a Linear user id (best-effort).
-        creator_id: Optional[str] = None
-        rep = (parsed.get("reporter") or "").strip()
-        if rep:
-            try:
-                if rep.lower() == "me":
-                    creator_id = await self.linear.resolve_assignee(
-                        discord_user_id=getattr(requester, "id", 0),
-                        display_name=_display(requester),
-                        discord_linear_map=config.DISCORD_LINEAR_MAP,
-                    )
-                else:
-                    creator_id = await self.linear.resolve_assignee(
-                        discord_user_id=0,
-                        display_name=rep,
-                        discord_linear_map={},
-                    )
-            except Exception:
-                log.exception("[query] reporter resolution raised for %r", rep)
-                creator_id = None
-            if not creator_id:
-                # Asker explicitly asked for a person's issues but we can't
-                # map them. Returning [] is more honest than listing everybody.
-                log.info(
-                    "[query] reporter %r could not be mapped to a Linear user; returning empty",
-                    rep,
-                )
-                return [], False
-
-        labels = parsed.get("labels") or []
-        state_types = self._state_types_for(parsed.get("states") or [])
-        created_after = self._cutoff_iso(int(parsed.get("window_days", 0) or 0))
-        search_term = (parsed.get("search_term") or "").strip()
-
-        # Pure free-text and nothing else → use the cheaper text search.
-        if search_term and not (creator_id or labels or state_types or created_after):
-            hits = await self.linear.search_issues(search_term)
-            return [self._search_hit_to_issue(h) for h in hits[:QUERY_LIST_LIMIT]], False
-
-        issues = await self.linear.list_issues(
-            creator_id=creator_id,
-            label_names=labels or None,
-            state_types=state_types or None,
-            created_after=created_after,
-            limit=QUERY_LIST_LIMIT,
+    def _linking_tools(self, message: discord.Message) -> list[dict]:
+        """Per-request read-only tools that bridge the stored Discord↔Linear
+        mapping (db.py) to the engine. Handlers close over the current message so
+        `tracked_issue_for_message` can default to whatever this question replies
+        to. Read-only: they only read the DB, Linear, and Discord history."""
+        reply_ctx_id = (
+            getattr(message.reference, "message_id", None)
+            if message.reference
+            else None
         )
-        return issues, False
+
+        async def _source_message_for_issue(inp: dict):
+            ident = str(inp.get("identifier") or "").strip()
+            if not ident:
+                return {"error": "source_message_for_issue requires 'identifier'"}
+            issue = await self.linear.get_issue(ident)
+            if not issue:
+                return {"error": f"no Linear issue '{ident}'"}
+            rows = self.db.get_messages_for_issue(issue.get("id"))
+            base = {
+                "identifier": issue.get("identifier"),
+                "title": issue.get("title"),
+                "url": issue.get("url"),
+            }
+            if not rows:
+                return {
+                    **base,
+                    "linked_messages": [],
+                    "note": (
+                        "No stored Discord link — the bot did not create or update "
+                        "this issue itself (links only exist for those)."
+                    ),
+                }
+            return {
+                **base,
+                "linked_messages": [await self._describe_linked_message(r) for r in rows],
+            }
+
+        async def _tracked_issue_for_message(inp: dict):
+            mid = self._coerce_message_id(inp.get("message_id"))
+            if mid is None:
+                mid = reply_ctx_id
+            if mid is None:
+                return {
+                    "error": (
+                        "No message referenced. Reply to a Discord message and ask, "
+                        "or pass a message id / jump link."
+                    )
+                }
+            link = self.db.get_issue_for_message(mid)
+            if not link:
+                return {
+                    "tracked": False,
+                    "message_id": str(mid),
+                    "note": (
+                        "No tracked Linear issue for this message — the bot didn't "
+                        "file or update one from it."
+                    ),
+                }
+            issue = await self.linear.get_issue(link["linear_issue_id"])
+            return {
+                "tracked": True,
+                "message_id": str(mid),
+                "identifier": (issue or {}).get("identifier"),
+                "title": (issue or {}).get("title"),
+                "state": (issue or {}).get("state"),
+                "url": (issue or {}).get("url"),
+                "db_status": link.get("status"),
+                "linked_at": link.get("created_at"),
+            }
+
+        return [
+            {
+                "schema": {
+                    "name": "source_message_for_issue",
+                    "description": (
+                        "Given a Linear issue identifier (e.g. NFT2-591), return the "
+                        "originating Discord message(s) the bot created/updated the issue "
+                        "from — author, timestamp, text snippet, and a jump link. Only "
+                        "issues the bot itself filed/updated have a stored link; "
+                        "'linked_messages' is empty otherwise."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "identifier": {
+                                "type": "string",
+                                "description": "Linear issue key, e.g. NFT2-591.",
+                            }
+                        },
+                        "required": ["identifier"],
+                    },
+                },
+                "handler": _source_message_for_issue,
+            },
+            {
+                "schema": {
+                    "name": "tracked_issue_for_message",
+                    "description": (
+                        "Given a Discord message (by id or jump link, or — if omitted — "
+                        "the message the current question is a reply to), return the Linear "
+                        "issue the bot filed/updated from it, or tracked=false if none. Use "
+                        "for 'is this already tracked?'."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {
+                                "type": "string",
+                                "description": (
+                                    "Discord message id or jump URL. Omit to use the message "
+                                    "this question replies to."
+                                ),
+                            }
+                        },
+                        "required": [],
+                    },
+                },
+                "handler": _tracked_issue_for_message,
+            },
+        ]
+
+    async def _describe_linked_message(self, row: dict) -> dict:
+        """Turn a stored linkage row into a rich, model-friendly dict: author,
+        timestamp, snippet, and a jump link — fetched live from Discord. Degrades
+        gracefully (a 'note' instead) when the message is deleted or the channel
+        is unreadable, so a missing message never breaks the answer."""
+        try:
+            channel_id = int(row["channel_id"])
+            message_id = int(row["message_id"])
+        except (TypeError, ValueError):
+            return {"note": "malformed linkage row", "status": row.get("status")}
+
+        out: dict = {
+            "message_id": str(message_id),
+            "channel_id": str(channel_id),
+            "db_status": row.get("status"),
+            "linked_at": row.get("created_at"),
+        }
+
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except discord.DiscordException:
+                channel = None
+
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        if guild_id:
+            out["jump_url"] = (
+                f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+            )
+        out["channel"] = getattr(channel, "name", None)
+
+        if channel is None:
+            out["note"] = "channel not accessible to the bot"
+            return out
+        try:
+            msg = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            out["note"] = "original Discord message was deleted"
+            return out
+        except discord.DiscordException:
+            out["note"] = "Discord message unreadable"
+            return out
+
+        out["jump_url"] = msg.jump_url or out.get("jump_url")
+        out["author"] = _display(msg.author)
+        out["timestamp"] = msg.created_at.isoformat()
+        snippet = (msg.content or "").strip().replace("\n", " ")
+        out["snippet"] = (snippet[:180] + "…") if len(snippet) > 180 else (snippet or "(no text)")
+        return out
 
     @staticmethod
-    def _state_types_for(states: list[str]) -> list[str]:
-        """Union the coarse state tokens into Linear workflow state TYPEs.
-        Empty (or anything mapping to no types) means "no state filter"."""
-        out: list[str] = []
-        for s in states or []:
-            for t in _QUERY_STATE_TYPES.get(s, []):
-                if t not in out:
-                    out.append(t)
-        return out
+    def _coerce_message_id(val) -> Optional[int]:
+        """Parse a Discord message id from a raw id string or a jump URL
+        (…/channels/<guild>/<channel>/<message>). None if it isn't an id."""
+        if not val:
+            return None
+        s = str(val).strip().rstrip("/")
+        if s.isdigit():
+            return int(s)
+        tail = s.split("/")[-1]
+        return int(tail) if tail.isdigit() else None
+
 
     @staticmethod
     def _cutoff_iso(days: int) -> Optional[str]:
@@ -1870,109 +1841,3 @@ class TriageBot(discord.Client):
             lines.append("")
             lines.append(f"_{coverage_note}_")
         return "\n".join(lines)
-
-    @staticmethod
-    def _search_hit_to_issue(hit: dict) -> dict:
-        """search_issues returns a thinner shape than list_issues — pad to the
-        same keys so the formatter doesn't have to special-case."""
-        return {
-            "id": hit.get("id"),
-            "identifier": hit.get("identifier"),
-            "title": hit.get("title"),
-            "url": hit.get("url"),
-            "state": hit.get("state"),
-            "state_type": None,
-            "labels": [],
-            "assignee": None,
-            "creator": None,
-            "latest_comment": None,
-        }
-
-    def _format_issue_list(self, issues: list[dict]) -> str:
-        if not issues:
-            return "_(no matching Linear issues)_"
-
-        lines = [f"**{len(issues)}** matching issue(s):"]
-        for issue in issues[:QUERY_LIST_LIMIT]:
-            ident = issue.get("identifier") or "?"
-            title = (issue.get("title") or "(untitled)").strip()
-            if len(title) > 80:
-                title = title[:77] + "…"
-            state = issue.get("state") or "?"
-            url = issue.get("url") or ""
-            link = f"[{ident}]({url})" if url else ident
-            lines.append(f"• {link} — _{state}_ — {title}")
-        if len(issues) > QUERY_LIST_LIMIT:
-            lines.append(f"_(showing {QUERY_LIST_LIMIT} of {len(issues)})_")
-        return "\n".join(lines)
-
-    def _format_single_issue(self, issue: dict, *, detail: str = "none") -> str:
-        """Render one issue as a Discord reply.
-
-        detail:
-          - "none"        → summary line + assignee/labels + latest comment (as before).
-          - "more"        → summary, then the issue DESCRIPTION under it.
-          - "description" → LEAD with the full DESCRIPTION, then a compact summary.
-
-        A long description is truncated to ~DESCRIPTION_MAX_CHARS (and further, if
-        needed, to keep the whole reply within Discord's message ceiling) with a
-        "…(full text in Linear)" pointer + URL — never silently dropped. An issue
-        with no description says so explicitly when a description was requested."""
-        ident = issue.get("identifier") or "?"
-        title = (issue.get("title") or "(untitled)").strip()
-        state = issue.get("state") or "?"
-        url = issue.get("url") or ""
-        link = f"[**{ident}**]({url})" if url else f"**{ident}**"
-        assignee = issue.get("assignee") or "_unassigned_"
-
-        summary = [
-            f"{link} — _{state}_",
-            f"**{title}**",
-            f"Assignee: {assignee}",
-        ]
-        if issue.get("labels"):
-            summary.append(f"Labels: {', '.join(issue['labels'])}")
-
-        # Plain status check — original behaviour, no description block.
-        if detail == "none":
-            latest = issue.get("latest_comment")
-            if latest and (latest.get("body") or "").strip():
-                body = latest["body"].strip()
-                if len(body) > 250:
-                    body = body[:247] + "…"
-                author = latest.get("author") or "?"
-                summary += ["", f"_Latest comment by @{author}:_", f"> {body}"]
-            return "\n".join(summary)
-
-        # Description requested ("more" / "description") — budget the body against
-        # the reply ceiling so the Linear pointer can't get clipped off the end.
-        summary_text = "\n".join(summary)
-        budget = DISCORD_REPLY_BUDGET - len(summary_text) - 40  # 40 ≈ headers/separators
-        block = self._format_description_block(issue.get("description"), url, budget=budget)
-
-        if detail == "description":
-            # Lead with the description; compact summary follows.
-            return f"{block}\n\n{summary_text}"
-        # "more" — summary first, description underneath.
-        return f"{summary_text}\n\n**Description:**\n{block}"
-
-    @staticmethod
-    def _format_description_block(
-        description: Optional[str], url: str, *, budget: int
-    ) -> str:
-        """Render an issue description for inlining: trimmed to the smaller of
-        DESCRIPTION_MAX_CHARS and `budget`, with a Linear pointer when cut.
-        Empty/whitespace description → an explicit "(no description set)"."""
-        desc = (description or "").strip()
-        if not desc:
-            return "_(no description set)_"
-        limit = min(DESCRIPTION_MAX_CHARS, max(200, budget))
-        if len(desc) <= limit:
-            return desc
-        truncated = desc[:limit].rstrip()
-        pointer = (
-            f"\n\n_…(truncated — full text in Linear: {url})_"
-            if url
-            else "\n\n_…(truncated — full text in Linear)_"
-        )
-        return truncated + pointer
