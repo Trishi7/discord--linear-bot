@@ -18,11 +18,13 @@ from typing import Optional
 
 import discord
 
+import archive as archive_mod
 import config
 import query
+import standup
 from classifier import Classifier
 from db import DB
-from linear_client import LinearClient, LinearError
+from linear_client import LinearClient, LinearError, SIGNAL_TO_STATE_NAME
 from query_engine import QueryEngine
 
 log = logging.getLogger(__name__)
@@ -46,18 +48,25 @@ _CATEGORY_LABEL_NAME = {
     "improvement": "Improvement",
 }
 
-# Human-readable form of a status_signal for embed / confirmation text.
-_SIGNAL_HUMAN = {
-    "resolved": "resolved",
-    "in_progress": "in-progress",
-    "cannot_reproduce": "cannot-reproduce",
-}
+# Team convention: a Bug ALWAYS carries a system label showing where the fix lives.
+_SYSTEM_LABELS = {"BE", "FE", "UI"}
+
+# Team convention: NEVER assign a bug to QA (Harsh). Lower-cased mention names.
+_NEVER_BUG_ASSIGNEE_NAMES = {"harsh"}
 
 # Linear workflow state TYPEs we consider "open" for duplicate detection.
 _OPEN_STATE_TYPES = {"backlog", "unstarted", "started", "triage"}
 
 # Cap on how many issues the Discord person-activity fallback render lists.
 QUERY_LIST_LIMIT = 10
+
+# Discord hard-caps a single message at 2000 chars and SILENTLY DROPS the rest,
+# so query-mode replies are split across messages at ~1900 to leave headroom.
+QUERY_REPLY_CHUNK = 1900
+# Safety cap on how many messages one query reply may fan out into. Beyond this
+# we clip with a note rather than flood the channel — the engine/classifier
+# prompts are tuned to summarise, so hitting this means an answer stayed long.
+QUERY_REPLY_MAX_MESSAGES = 4
 
 # Cap on how far we walk the reply chain / how much channel history we scan
 # when gathering messages associated with one.
@@ -169,6 +178,42 @@ def _format_comment_body(message: discord.Message, *, needs_triage: bool = False
     return "\n".join(lines)
 
 
+def _split_for_discord(body: str, limit: int = QUERY_REPLY_CHUNK) -> list[str]:
+    """Split `body` into Discord-sendable chunks of at most `limit` chars,
+    breaking ONLY on line boundaries so we never cut mid-line or mid-sentence.
+    A single line longer than `limit` (a giant URL or an unbroken paragraph) is
+    hard-wrapped as a last resort. Always returns at least one chunk."""
+    body = body or ""
+    if len(body) <= limit:
+        return [body]
+
+    chunks: list[str] = []
+    current = ""
+    for line in body.split("\n"):
+        # An oversize line can't share a chunk: flush what we have, then emit it
+        # in full-width slices, carrying any remainder into `current`.
+        if len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            for i in range(0, len(line), limit):
+                piece = line[i : i + limit]
+                if len(piece) == limit:
+                    chunks.append(piece)
+                else:
+                    current = piece
+            continue
+        # +1 accounts for the "\n" we re-insert between lines.
+        if current and len(current) + 1 + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 class TriageBot(discord.Client):
     def __init__(self) -> None:
         log.info("[bot.init] Setting up Discord intents (message_content, reactions)")
@@ -187,6 +232,9 @@ class TriageBot(discord.Client):
         self.query_engine = QueryEngine(
             config.ANTHROPIC_API_KEY, config.CLASSIFIER_MODEL, self.linear
         )
+        # Archive snapshot: loaded + indexed ONCE at startup (read-only fallback).
+        log.info("[bot.init] Loading archive snapshot (file=%r)", config.ARCHIVE_FILE)
+        self.archive = archive_mod.Archive(config.ARCHIVE_FILE)
         log.info(
             "[bot.init] TriageBot ready (require_approval=%s, allowlist: %d ids + %d names)",
             config.REQUIRE_APPROVAL,
@@ -195,11 +243,18 @@ class TriageBot(discord.Client):
         )
 
     async def on_ready(self) -> None:
+        query_channel = config.query_channel_id()
+        query_desc = (
+            f"{query_channel} (dedicated)"
+            if config.QUERY_CHANNEL_ID
+            else f"{query_channel} (approval-channel fallback)"
+        )
         log.info(
-            "Logged in as %s. Monitoring %d channels, posting to channel %s. require_approval=%s",
+            "Logged in as %s. Monitoring %d channels, approvals→%s, queries→%s. require_approval=%s",
             self.user,
             len(config.MONITORED_CHANNEL_IDS),
             config.APPROVAL_CHANNEL_ID,
+            query_desc,
             config.REQUIRE_APPROVAL,
         )
 
@@ -213,8 +268,9 @@ class TriageBot(discord.Client):
             return
 
         # QUERY MODE — must run BEFORE the report pipeline so a question can
-        # never become a ticket. Trigger: explicit @-mention of self in a
-        # monitored channel OR the approval channel. Replies in the same
+        # never become a ticket. Trigger: any human message in the dedicated
+        # query channel, or an explicit @-mention of self in a monitored channel
+        # (or the approval channel in fallback mode). Replies in the same
         # channel. Read-only — never creates or modifies anything.
         #
         # NOTE: query mode deliberately runs BEFORE the reporter allowlist — any
@@ -225,10 +281,11 @@ class TriageBot(discord.Client):
             handled = await self._handle_query(message)
             if handled:
                 return
-            # Fell through: parse_query said "not a Linear question". In a
-            # monitored channel let the report pipeline have a go; in the
-            # approval channel there's no report path, so nudge politely.
-            if message.channel.id == config.APPROVAL_CHANNEL_ID:
+            # Fell through: parse_query said "not a Linear question". A query-only
+            # channel (the dedicated query channel, or the approval channel in
+            # fallback mode) has no report path, so nudge politely; a monitored
+            # channel falls through to the report pipeline below.
+            if config.is_query_only_channel(message.channel.id):
                 await self._safe_reply(
                     message,
                     "I only answer questions here. Try `what is Sid working on?`, "
@@ -236,8 +293,19 @@ class TriageBot(discord.Client):
                 )
                 return
 
+        # HARD RULE: the query channel is query-only. Even if it accidentally
+        # overlaps a monitored channel, classification / ticket creation NEVER
+        # runs on messages here.
+        if config.is_query_only_channel(message.channel.id):
+            log.debug(
+                "on_message msg=%s dropped: query-only channel %s (no triage)",
+                message.id,
+                message.channel.id,
+            )
+            return
+
         # B) Drop non-monitored channels at debug-level so the terminal stays
-        # readable. Approval channel ends here unless a query handled it above.
+        # readable. Query/approval channels end here unless a query handled them.
         if message.channel.id not in config.MONITORED_CHANNEL_IDS:
             log.debug(
                 "on_message msg=%s dropped: channel %s not monitored",
@@ -416,11 +484,8 @@ class TriageBot(discord.Client):
         still fire. Reuses the exact on_message query gate (`_is_query_trigger`)
         and the existing `_handle_query` path — no duplicated logic."""
         # Cheap early-out before any network fetch: only the channels query mode
-        # listens on (monitored OR approval).
-        if not (
-            payload.channel_id in config.MONITORED_CHANNEL_IDS
-            or payload.channel_id == config.APPROVAL_CHANNEL_ID
-        ):
+        # listens on (monitored channels OR the query channel).
+        if not self._listens_for_query(payload.channel_id):
             return
 
         # Resolve the channel — prefer the cache, but fall back to REST: a cache
@@ -572,7 +637,14 @@ class TriageBot(discord.Client):
                 status_signal,
             )
             comment_body = _format_comment_body(message, needs_triage=needs_triage)
-            kind = "comment_transition" if status_signal != "none" else "comment"
+            # Only "resolved"/"in_progress" carry a status move (→ Implemented /
+            # In Progress). "cannot_reproduce" and "none" stay comment-only — per
+            # convention, cancellation is a PM decision that needs a reason.
+            kind = (
+                "comment_transition"
+                if status_signal in ("resolved", "in_progress")
+                else "comment"
+            )
             parent_title = (parent.get("classification") or {}).get("title", "")
             return {
                 **base,
@@ -606,14 +678,9 @@ class TriageBot(discord.Client):
 
         # Path C: CREATE.
         log.info("[plan] no dup → CREATE (needs_triage=%s)", needs_triage)
-        mentioned_names = list(verdict.get("mentioned_assignees") or [])
-        assignee_id, intended_name, extras = await self._resolve_assignee_for_plan(
-            thread=thread,
-            mentioned_names=mentioned_names,
-            needs_triage=needs_triage,
-        )
 
-        # E) Labels: category → label name + area_labels, in that order.
+        # E) Labels first: category → label name + area_labels, in that order.
+        # Only the six real labels can result (category map + BE/FE/UI areas).
         label_names: list[str] = []
         cat_label = _CATEGORY_LABEL_NAME.get(category)
         if cat_label:
@@ -621,6 +688,21 @@ class TriageBot(discord.Client):
         for area in verdict.get("area_labels") or []:
             if area and area not in label_names:
                 label_names.append(area)
+
+        # Convention: a Bug ALWAYS pairs a system label (BE/FE/UI) showing where
+        # the fix lives. If the classifier didn't supply one we can't invent it,
+        # so route to PM triage (unassigned + flagged) rather than guess.
+        if category == "bug" and not (_SYSTEM_LABELS & set(label_names)):
+            log.info("[plan] bug lacks a BE/FE/UI system label → forcing needs_triage")
+            needs_triage = True
+
+        mentioned_names = list(verdict.get("mentioned_assignees") or [])
+        assignee_id, intended_name, extras = await self._resolve_assignee_for_plan(
+            thread=thread,
+            mentioned_names=mentioned_names,
+            needs_triage=needs_triage,
+            category=category,
+        )
 
         description = self._build_new_issue_description(
             verdict=verdict,
@@ -632,10 +714,12 @@ class TriageBot(discord.Client):
             needs_triage=needs_triage,
             intended_assignee=intended_name,
             extras=extras,
+            category=category,
         )
 
         return {
             **base,
+            "needs_triage": needs_triage,
             "kind": "create_needs_triage" if needs_triage else "create",
             "description": description,
             "label_names": label_names,
@@ -713,11 +797,14 @@ class TriageBot(discord.Client):
         thread: list[discord.Message],
         mentioned_names: list[str],
         needs_triage: bool,
+        category: str = "",
     ) -> tuple[Optional[str], Optional[str], list[str]]:
         """Returns (assignee_id, intended_name, extras).
 
         - No mentions → (None, None, []).
         - needs_triage → force unassigned, surface ALL mentions as extras.
+        - Convention: NEVER assign a BUG to QA (Harsh). If the primary mention is
+          Harsh on a bug, leave it unassigned (surfaced as intended) for PM triage.
         - Otherwise: try mentioned_names[0]. On resolve → (id, None, rest).
                      On miss → (None, primary, rest). Don't fall through to
                      mentioned_names[1] (per spec)."""
@@ -728,6 +815,15 @@ class TriageBot(discord.Client):
 
         primary = mentioned_names[0]
         extras = list(mentioned_names[1:])
+
+        if category == "bug" and primary.strip().lower() in _NEVER_BUG_ASSIGNEE_NAMES:
+            log.info(
+                "[plan] primary mention %r is QA — never assign a bug to Harsh; "
+                "leaving unassigned for PM triage",
+                primary,
+            )
+            return (None, primary, extras)
+
         name_to_id = self._build_thread_name_id_map(thread)
         primary_id = name_to_id.get(primary.strip().lower(), 0)
 
@@ -775,58 +871,57 @@ class TriageBot(discord.Client):
         needs_triage: bool,
         intended_assignee: Optional[str],
         extras: list[str],
+        category: str = "",
     ) -> str:
-        parts: list[str] = [verdict["description"].strip() or "_(no description)_"]
+        """Render the Linear issue body in the team's convention shape. For a bug:
+        What was reported / (repro + expected-vs-actual are folded into the
+        classifier restatement) / the reporter's own words / Screenshots &
+        recordings (every image AND video link) / Raised by / a Needs-triage note.
+        Feature/improvement uses a lighter "What's being asked" lead — the PM
+        expands it into the full project template later."""
+        is_bug = category == "bug"
+        lead_label = "What was reported" if is_bug else "What's being asked"
+        body = verdict["description"].strip() or "_(no description)_"
+        parts: list[str] = [f"**{lead_label}:**", body]
 
-        if needs_triage:
-            parts.append("")
-            parts.append(
-                "⚠️ **Needs triage** — classifier was uncertain about the category; "
-                "please verify and reassign."
-            )
-
-        parts.append("")
-        parts.append("---")
-        parts.append(f"**Raised by:** @{reporter}")
-        if source_jump:
-            parts.append(f"**Source:** {source_jump}")
-
+        # The reporter's own words — kept verbatim so meaning isn't paraphrased away.
         if len(thread) > 1:
             thread_text, _ = _format_thread(thread)
-            parts.append("")
-            parts.append("**Thread context:**")
-            parts.append("```")
-            parts.append(thread_text)
-            parts.append("```")
+            parts += ["", "**Reporter's words (thread):**", "```", thread_text, "```"]
         else:
             snippet = source_text.strip()
             if len(snippet) > 1500:
                 snippet = snippet[:1497] + "…"
             if snippet:
-                parts.append("")
-                parts.append("**Original message:**")
-                parts.append(f"> {snippet}")
+                parts += ["", "**Reporter's words:**", f"> {snippet}"]
 
+        # Every image AND video (and any other) attachment link — never dropped.
         if attachments:
-            parts.append("")
-            parts.append("**Attachments:**")
+            parts += ["", "**Screenshots & recordings:**"]
             for a in attachments:
                 ctype = (a.content_type or "").lower()
                 kind = ctype.split("/", 1)[0] if "/" in ctype else "file"
                 parts.append(f"- {kind}: [{a.filename}]({a.url})")
 
-        if intended_assignee:
-            parts.append("")
-            parts.append(
-                f"_Intended assignee:_ **@{intended_assignee}** "
-                f"(no matching Linear user — left unassigned)"
-            )
+        parts += ["", "---", f"**Raised by:** @{reporter}"]
+        if source_jump:
+            parts.append(f"**Source:** {source_jump}")
 
+        if intended_assignee:
+            parts += [
+                "",
+                f"_Intended assignee:_ **@{intended_assignee}** "
+                f"(no matching Linear user — left unassigned)",
+            ]
         if extras:
-            parts.append("")
-            parts.append(
-                "_Also mentioned:_ " + ", ".join(f"**@{x}**" for x in extras)
-            )
+            parts += ["", "_Also mentioned:_ " + ", ".join(f"**@{x}**" for x in extras)]
+
+        if needs_triage:
+            parts += [
+                "",
+                "⚠️ **Needs triage** — verify the category / system label and (re)assign "
+                "(PM). For a bug, confirm the BE/FE/UI label showing where the fix lives.",
+            ]
 
         return "\n".join(parts)
 
@@ -892,10 +987,10 @@ class TriageBot(discord.Client):
         if kind == "comment":
             return f"Comment on {target}"
         if kind == "comment_transition":
-            signal = _SIGNAL_HUMAN.get(
-                plan.get("status_signal", ""), plan.get("status_signal", "")
-            )
-            return f"Comment + mark {target} {signal}"
+            state_name = SIGNAL_TO_STATE_NAME.get(plan.get("status_signal", ""))
+            if state_name:
+                return f"Comment + move {target} → {state_name} (never Done)"
+            return f"Comment on {target}"
         if kind == "comment_dup":
             return f"Comment on {target} (matched as duplicate)"
         return kind
@@ -1184,26 +1279,37 @@ class TriageBot(discord.Client):
             log.exception("[exec-comment] add_comment failed for %s", target_id)
             return None
 
+        transitioned_to: Optional[str] = None
         if transition:
             log.info(
                 "[exec-comment] step 2/2: transitioning %s via signal=%s",
                 target_id,
                 plan.get("status_signal"),
             )
-            # set_issue_status is best-effort and never raises.
+            # set_issue_status is best-effort and never raises. It returns the
+            # updated issue only when it actually moved (→ Implemented / In
+            # Progress); a missing/forbidden target state yields None, i.e. we
+            # commented and left the status change to the PM.
             try:
-                await self.linear.set_issue_status(
+                updated = await self.linear.set_issue_status(
                     target_id, plan.get("status_signal", "none")
                 )
+                if updated:
+                    transitioned_to = (updated.get("state") or {}).get("name")
             except Exception:
                 log.exception("[exec-comment] set_issue_status raised (continuing)")
 
         log.info(
-            "[exec-comment] DONE target=%s comment_url=%s",
+            "[exec-comment] DONE target=%s comment_url=%s transitioned_to=%s",
             target_id,
             comment.get("url"),
+            transitioned_to,
         )
-        return {"linear_issue_id": target_id, "comment_url": comment.get("url")}
+        return {
+            "linear_issue_id": target_id,
+            "comment_url": comment.get("url"),
+            "transitioned_to": transitioned_to,
+        }
 
     def _format_result_message(self, plan: dict, result: dict) -> str:
         kind = plan["kind"]
@@ -1223,10 +1329,10 @@ class TriageBot(discord.Client):
             url = result.get("comment_url") or plan.get("target_issue_url") or ""
             link = f"[{target}]({url})" if url else target
             if kind == "comment_transition":
-                signal = _SIGNAL_HUMAN.get(
-                    plan.get("status_signal", ""), plan.get("status_signal", "")
-                )
-                return f"💬 Commented on {link} and marked **{signal}**"
+                moved = result.get("transitioned_to")
+                if moved:
+                    return f"💬 Commented on {link} and moved to **{moved}**"
+                return f"💬 Commented on {link} — status change left to the PM"
             if kind == "comment_dup":
                 return f"💬 Found likely duplicate — commented on {link}"
             return f"💬 Commented on {link}"
@@ -1234,20 +1340,33 @@ class TriageBot(discord.Client):
 
     # -- query mode (read-only) ------------------------------------------
 
+    def _listens_for_query(self, channel_id: int) -> bool:
+        """Channels where query mode is active: the monitored channels (queries
+        allowed via @-mention) plus the dedicated query channel — or, when no
+        dedicated channel is set, the approval channel (fallback)."""
+        if channel_id in config.MONITORED_CHANNEL_IDS:
+            return True
+        return channel_id == config.query_channel_id()
+
     def _is_query_trigger(self, message: discord.Message) -> bool:
         """The single source of truth for "should this message be handled as a
         query?" — shared by `on_message` and `on_raw_message_edit` so an edit
-        re-fires for exactly the same messages a fresh send would. A trigger is:
-        a non-bot author, in a monitored channel OR the approval channel, with an
-        explicit @-mention of the bot. Deliberately does NOT gate on the reporter
-        allowlist — query mode is open to anyone (unlike the report pipeline)."""
+        re-fires for exactly the same messages a fresh send would. Deliberately
+        does NOT gate on the reporter allowlist — query mode is open to anyone
+        (unlike the report pipeline).
+
+        In the DEDICATED query channel every non-bot human message is a potential
+        query (the @-mention requirement is dropped). Everywhere else queries are
+        allowed — the monitored channels, or the approval channel in fallback
+        mode — an explicit @-mention of the bot is still required."""
         if message.author.bot:
             return False
-        in_query_channel = (
-            message.channel.id in config.MONITORED_CHANNEL_IDS
-            or message.channel.id == config.APPROVAL_CHANNEL_ID
-        )
-        return in_query_channel and self._is_self_mentioned_explicitly(message)
+        ch = message.channel.id
+        if not self._listens_for_query(ch):
+            return False
+        if config.is_dedicated_query_channel(ch):
+            return True
+        return self._is_self_mentioned_explicitly(message)
 
     def _is_self_mentioned_explicitly(self, message: discord.Message) -> bool:
         """True if the bot's user is @-mentioned in the message TEXT.
@@ -1268,14 +1387,41 @@ class TriageBot(discord.Client):
         return text.strip()
 
     async def _safe_reply(self, message: discord.Message, body: str) -> None:
-        """Reply in the same channel, no @-ping on the original author."""
-        # Discord message body cap ~2000 chars; clip with ellipsis.
-        if len(body) > 1900:
-            body = body[:1897] + "…"
-        try:
-            await message.reply(body, mention_author=False)
-        except discord.DiscordException:
-            log.exception("[query] reply failed")
+        """Reply in the same channel, no @-ping on the original author.
+
+        Discord silently drops anything past ~2000 chars per message, so a long
+        answer is split on line boundaries (never mid-sentence) and sent as
+        several messages in order: the first as a reply to the source message,
+        the rest as plain sends to the same channel so it reads top-to-bottom.
+        A pathologically long answer is clipped at QUERY_REPLY_MAX_MESSAGES with
+        a note rather than flooding the channel."""
+        chunks = _split_for_discord(body or "…")
+
+        if len(chunks) > QUERY_REPLY_MAX_MESSAGES:
+            log.info(
+                "[query] reply is %d chunks; clipping to %d",
+                len(chunks),
+                QUERY_REPLY_MAX_MESSAGES,
+            )
+            chunks = chunks[:QUERY_REPLY_MAX_MESSAGES]
+            note = "\n\n…(reply truncated — ask a narrower question for the rest)"
+            last = chunks[-1]
+            if len(last) + len(note) > QUERY_REPLY_CHUNK:
+                last = last[: QUERY_REPLY_CHUNK - len(note)]
+            chunks[-1] = last + note
+
+        channel = message.channel
+        for i, chunk in enumerate(chunks):
+            try:
+                if i == 0:
+                    await message.reply(chunk, mention_author=False)
+                else:
+                    await channel.send(chunk)
+            except discord.DiscordException:
+                log.exception(
+                    "[query] reply chunk %d/%d failed", i + 1, len(chunks)
+                )
+                return
 
     async def _handle_query(self, message: discord.Message) -> bool:
         """Handle an @-mention as a question.
@@ -1386,7 +1532,13 @@ class TriageBot(discord.Client):
                 question=text,
                 requester_name=requester_name,
                 requester_linear_id=requester_linear_id,
-                extra_tools=self._linking_tools(message),
+                extra_tools=(
+                    self._linking_tools(message)
+                    + self._standup_tools(text)
+                    + self._archive_tools()
+                    + self._leave_tools()
+                    + self._person_activity_tools(requester_name)
+                ),
             )
         except Exception:
             log.exception("[query.engine] answer raised")
@@ -1587,6 +1739,277 @@ class TriageBot(discord.Client):
         tail = s.split("/")[-1]
         return int(tail) if tail.isdigit() else None
 
+    # -- query mode: standup notes (read-only, query-only) ---------------
+
+    def _standup_tools(self, question_text: str) -> list[dict]:
+        """Per-request read-only tools exposing synced Gemini standup notes to the
+        engine. READ-ONLY and QUERY-ONLY — standup data never feeds ticket
+        creation. Handlers offload blocking file/subprocess work to threads,
+        run a sync-on-demand for "today/this morning" questions when
+        STANDUP_SYNC_CMD is set, resolve owner names to Linear users, and always
+        surface freshness so a reply can state how current the data is."""
+
+        async def _resolve_owner(name: str) -> Optional[dict]:
+            """Best-effort owner display-name → Linear user, using the same
+            resolver as elsewhere. Falls back to the first name for full-name
+            invitees like "Shriraksha M" / "Samyuktha Bhaskar"."""
+            nm = (name or "").strip()
+            if not nm:
+                return None
+            try:
+                res = await self.linear.resolve_member_id(nm)
+                if isinstance(res, dict) and res.get("id") is None and " " in nm:
+                    res = await self.linear.resolve_member_id(nm.split()[0])
+            except Exception:
+                log.exception("[standup] owner resolution raised for %r", nm)
+                return None
+            if isinstance(res, dict) and res.get("id"):
+                return {"id": res["id"], "displayName": res.get("displayName")}
+            return None
+
+        async def _freshness_note() -> dict:
+            latest_date, mtime = await asyncio.to_thread(standup.freshness)
+            return {"latest_date_on_disk": latest_date, "synced_file_mtime": mtime}
+
+        async def _list_standups(inp: dict):
+            if not config.STANDUP_DIR:
+                return {"enabled": False, "note": "Standup notes aren't configured (STANDUP_DIR unset)."}
+            try:
+                days = int(inp.get("days") or 14)
+            except (TypeError, ValueError):
+                days = 14
+            notes = await asyncio.to_thread(standup.list_standups, max(1, days))
+            return {
+                "enabled": True,
+                "standups": notes,
+                "freshness": await _freshness_note(),
+            }
+
+        async def _read_standup(inp: dict):
+            if not config.STANDUP_DIR:
+                return {"enabled": False, "note": "Standup notes aren't configured (STANDUP_DIR unset)."}
+
+            # Sync-on-demand: only for clearly recent/today questions, and only
+            # when a sync command is configured. Best-effort — read regardless.
+            synced = False
+            if config.STANDUP_SYNC_CMD and standup.wants_recent(question_text):
+                synced = await asyncio.to_thread(
+                    standup.sync_now, config.STANDUP_SYNC_CMD
+                )
+
+            date_arg = (inp.get("date") or None)
+            session_arg = (inp.get("session") or None)
+            note = await asyncio.to_thread(standup.read_standup, date_arg, session_arg)
+            freshness = await _freshness_note()
+
+            if not note:
+                return {
+                    "enabled": True,
+                    "found": False,
+                    "sync_attempted": synced,
+                    "freshness": freshness,
+                    "note": (
+                        "No matching standup on file"
+                        + (" (even after an on-demand sync)" if synced else "")
+                        + "."
+                    ),
+                }
+
+            # Enrich next-step owners with their Linear identity (read-only).
+            enriched = []
+            for step in note.get("next_steps") or []:
+                owner_linear = await _resolve_owner(step.get("owner_name") or "")
+                enriched.append({**step, "owner_linear": owner_linear})
+            note = {**note, "next_steps": enriched}
+
+            return {
+                "enabled": True,
+                "found": True,
+                "sync_attempted": synced,
+                "freshness": freshness,
+                "standup": note,
+            }
+
+        return [
+            {
+                "schema": {
+                    "name": "list_standups",
+                    "description": (
+                        "List recent team standup notes (synced 'Notes by Gemini' docs) as "
+                        "[{date, session (AM/PM), title, path}], newest first, plus a "
+                        "'freshness' block. Read-only; standup notes never affect Linear."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "days": {"type": "integer", "description": "Look-back window in days (default 14)."}
+                        },
+                        "required": [],
+                    },
+                },
+                "handler": _list_standups,
+            },
+            {
+                "schema": {
+                    "name": "read_standup",
+                    "description": (
+                        "Read one standup note. Returns its summary, decisions/aligned bullets, "
+                        "and next_steps as [{owner_name, task, owner_linear}], plus 'freshness' "
+                        "(latest_date_on_disk, synced_file_mtime). Omit 'date' for the most "
+                        "recent; optionally filter by 'session' (AM/PM). When you use this data "
+                        "you MUST state what's on file (e.g. 'Latest standup on file: AM sync "
+                        "2026-07-07'); if today's isn't present, say so — don't imply none happened."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "date": {"type": "string", "description": "YYYY-MM-DD; omit for the most recent on file."},
+                            "session": {"type": "string", "enum": ["AM", "PM"], "description": "Optional session filter."},
+                        },
+                        "required": [],
+                    },
+                },
+                "handler": _read_standup,
+            },
+        ]
+
+    # -- query mode: archive snapshot (read-only fallback) ---------------
+
+    def _archive_tools(self) -> list[dict]:
+        """Read-only tool over the frozen Done-issues snapshot. Used as a fallback
+        when live Linear can't return an issue. Every result carries the mandatory
+        provenance label so it's never mistaken for live data. Never feeds ticket
+        creation."""
+
+        async def _search_archive(inp: dict):
+            if not self.archive.enabled:
+                return {"enabled": False, "note": "Archive snapshot isn't configured (ARCHIVE_FILE unset/empty)."}
+            q = str(inp.get("query") or inp.get("text") or inp.get("identifier") or "").strip()
+            if not q:
+                return {"error": "search_archive requires a 'query' (identifier or keywords)."}
+            results = await asyncio.to_thread(self.archive.search, q)
+            return {
+                "enabled": True,
+                "snapshot_through": self.archive.snapshot_through,
+                "provenance_label": self.archive.label(),
+                "results": results,
+            }
+
+        return [
+            {
+                "schema": {
+                    "name": "search_archive",
+                    "description": (
+                        "Search the FROZEN archive snapshot of past Done issues by identifier "
+                        "(e.g. NFT2-123) or keywords. Use this ONLY as a fallback when live Linear "
+                        "(get_issue / search_issues) can't find an issue — it may have been "
+                        "archived. Returns [{identifier, title, labels, priority, owner, "
+                        "completed_date, url}] plus 'provenance_label'. You MUST append that "
+                        "provenance_label (e.g. '(from archive snapshot, through 2026-07-07)') to "
+                        "any answer that uses this data, and never present it as live — the "
+                        "snapshot knows nothing archived after its through-date."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Issue identifier (NFT2-123) or title keywords."}
+                        },
+                        "required": ["query"],
+                    },
+                },
+                "handler": _search_archive,
+            }
+        ]
+
+    # -- query mode: holiday / leave channel (read-only) -----------------
+
+    def _leave_tools(self) -> list[dict]:
+        """Read-only tool over the holiday/leave channel. Context for delays and
+        person-activity ("was X on leave?"). This channel is NOT monitored for
+        triage and never produces a ticket."""
+
+        async def _who_is_on_leave(inp: dict):
+            if not config.HOLIDAY_CHANNEL_ID:
+                return {"enabled": False, "note": "Holiday/leave channel isn't configured (HOLIDAY_CHANNEL_ID unset)."}
+            try:
+                days = int(inp.get("days") or 45)
+            except (TypeError, ValueError):
+                days = 45
+            around = (inp.get("around_date") or None)
+            entries = await query.who_is_on_leave(
+                self, days=max(1, days), around_date=around
+            )
+            return {"enabled": True, "days": days, "around_date": around, "leave": entries}
+
+        return [
+            {
+                "schema": {
+                    "name": "who_is_on_leave",
+                    "description": (
+                        "Read recent OOO / on-leave / holiday posts from the team's leave channel "
+                        "as [{person, dates, note, posted_at, jump_url}]. Use for 'why was X "
+                        "delayed' or to check if someone was away around a date. Pass 'around_date' "
+                        "(YYYY-MM-DD) to focus on one day, and 'days' for the look-back window "
+                        "(default 45). Read-only context — leave posts are never Linear data."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "around_date": {"type": "string", "description": "YYYY-MM-DD to focus on (optional)."},
+                            "days": {"type": "integer", "description": "Look-back window in days (default 45)."},
+                        },
+                        "required": [],
+                    },
+                },
+                "handler": _who_is_on_leave,
+            }
+        ]
+
+    # -- query mode: person recent Discord activity (read-only) ----------
+
+    def _person_activity_tools(self, requester_name: str) -> list[dict]:
+        """Per-request tool giving the engine one person's recent monitored-channel
+        Discord posts (with a done/fixed/deployed flag). This is the missing piece
+        that lets the engine cross-check "is this In-Progress ticket actually
+        finished?" for a reasoned "what is X working on" answer. READ-ONLY."""
+
+        async def _recent_discord_activity(inp: dict):
+            name = str(inp.get("name") or "").strip()
+            if name.lower() in ("", "me", "my", "myself", "i", "mine"):
+                name = requester_name
+            try:
+                days = int(inp.get("days") or config.QUERY_DISCORD_LOOKBACK_DAYS)
+            except (TypeError, ValueError):
+                days = config.QUERY_DISCORD_LOOKBACK_DAYS
+            return await query.person_recent_messages(
+                self, linear=self.linear, name=name, days=max(1, days)
+            )
+
+        return [
+            {
+                "schema": {
+                    "name": "recent_discord_activity",
+                    "description": (
+                        "Recent monitored-channel Discord posts by ONE person (resolves their "
+                        "identity), newest first, each with a 'done_signal' flag for "
+                        "'done/fixed/deployed'-style phrasing. Use it for 'what is X working on' "
+                        "to CROSS-CHECK whether an In-Progress Linear ticket was actually "
+                        "finished, and for what X has been doing lately. Returns {person, "
+                        "messages:[{channel, timestamp, text, jump_url, done_signal}]} — or "
+                        "{ambiguous, candidates} when the name is unclear (then ask which person)."
+                    ),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Person's name (or 'me' for the asker)."},
+                            "days": {"type": "integer", "description": "Look-back window in days (default from config)."},
+                        },
+                        "required": ["name"],
+                    },
+                },
+                "handler": _recent_discord_activity,
+            }
+        ]
 
     @staticmethod
     def _cutoff_iso(days: int) -> Optional[str]:
@@ -1794,7 +2217,10 @@ class TriageBot(discord.Client):
         want_linear = source in ("linear", "both")
         want_discord = source in ("discord", "both")
 
-        header = f"**{person} — what they're working on**"
+        # Compact, Discord-friendly render: bold labels (no headers), one line per
+        # item, single line breaks (no blank lines between sections) so short
+        # answers land in a single message.
+        header = f"**{person} — working on**"
         if source == "discord":
             header = f"**{person} — recent Discord activity**"
         elif source == "linear":
@@ -1804,7 +2230,7 @@ class TriageBot(discord.Client):
         lines = [header]
 
         if want_linear:
-            lines += ["", "**Working on (Linear):**"]
+            lines.append("**Linear:**")
             if linear_issues:
                 for i in linear_issues[:QUERY_LIST_LIMIT]:
                     ident = i.get("identifier") or "?"
@@ -1814,13 +2240,14 @@ class TriageBot(discord.Client):
                     status = i.get("state_name") or "?"
                     url = i.get("url") or ""
                     link = f"[{ident}]({url})" if url else ident
-                    lines.append(f"• {link} — {title} — _{status}_")
+                    lines.append(f"{link} — {title} · {status}")
+                if len(linear_issues) > QUERY_LIST_LIMIT:
+                    lines.append(f"_…and {len(linear_issues) - QUERY_LIST_LIMIT} more_")
             else:
                 lines.append("_nothing in Linear_")
 
         if want_discord:
-            lines.append("")
-            lines.append(f"**Recent Discord activity (last {window_days} days):**")
+            lines.append(f"**Discord (last {window_days} days):**")
             if discord_messages:
                 for m in discord_messages[:5]:
                     ts = m.get("timestamp")
@@ -1831,13 +2258,12 @@ class TriageBot(discord.Client):
                     jump = m.get("jump_url") or ""
                     ref = f" ([msg]({jump}))" if jump else ""
                     chan = m.get("channel") or "?"
-                    lines.append(f"• _{when}_ #{chan}: {snippet or '(no text)'}{ref}")
+                    lines.append(f"_{when}_ #{chan}: {snippet or '(no text)'}{ref}")
                 if len(discord_messages) > 5:
                     lines.append(f"_(+{len(discord_messages) - 5} more)_")
             else:
                 lines.append("_nothing in Discord_")
 
         if coverage_note:
-            lines.append("")
             lines.append(f"_{coverage_note}_")
         return "\n".join(lines)

@@ -35,9 +35,10 @@ def main() -> None:
         )
         sys.exit(2)
     log.info(
-        "[main] Config OK. monitored_channels=%s approval_channel=%s model=%s team=%s min_conf=%.2f min_len=%d delay=%.1fs db=%s",
+        "[main] Config OK. monitored_channels=%s approval_channel=%s query_channel=%s model=%s team=%s min_conf=%.2f min_len=%d delay=%.1fs db=%s",
         config.MONITORED_CHANNEL_IDS,
         config.APPROVAL_CHANNEL_ID,
+        config.QUERY_CHANNEL_ID or f"{config.query_channel_id()} (approval fallback)",
         config.CLASSIFIER_MODEL,
         config.LINEAR_TEAM_ID,
         config.MIN_CONFIDENCE,

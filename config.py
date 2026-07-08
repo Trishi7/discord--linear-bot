@@ -64,7 +64,35 @@ def _json_object(name: str, default: dict) -> dict:
 # Discord
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 MONITORED_CHANNEL_IDS = _int_list("MONITORED_CHANNEL_IDS")
-APPROVAL_CHANNEL_ID = int(os.getenv("APPROVAL_CHANNEL_ID", "0"))
+# Approval channel — where ✅/❌ approval embeds are posted and handled. NOTHING
+# else happens here (no query answering).
+APPROVAL_CHANNEL_ID = int(os.getenv("APPROVAL_CHANNEL_ID", "0") or "0")
+# Query channel — a dedicated channel for asking the bot questions. Query mode
+# runs here and replies here; no ticket creation, no approvals. In this channel
+# the @-mention requirement is DROPPED — every non-bot human message is treated
+# as a potential query. 0/unset → query mode falls back to the previous
+# behaviour (answering @-mention questions in the approval channel).
+QUERY_CHANNEL_ID = int(os.getenv("QUERY_CHANNEL_ID", "0") or "0")
+
+
+def query_channel_id() -> int:
+    """The channel the bot answers questions in: the dedicated QUERY_CHANNEL_ID
+    when set, else the approval channel (backwards-compatible fallback)."""
+    return QUERY_CHANNEL_ID or APPROVAL_CHANNEL_ID
+
+
+def is_dedicated_query_channel(channel_id: int) -> bool:
+    """True only when a dedicated QUERY_CHANNEL_ID is configured AND this is it.
+    A dedicated query channel drops the @-mention requirement; the approval-
+    channel fallback does not."""
+    return bool(QUERY_CHANNEL_ID) and channel_id == QUERY_CHANNEL_ID
+
+
+def is_query_only_channel(channel_id: int) -> bool:
+    """True for channels where the bot ONLY answers questions and NEVER runs
+    triage/ticket creation: the dedicated query channel, or — when none is set —
+    the approval channel (fallback)."""
+    return channel_id == query_channel_id()
 
 # Reporter allowlist — only messages from these users get classified.
 # IDs win over names; names are the fallback for users whose Discord ID we don't know yet.
@@ -100,6 +128,26 @@ QUERY_DISCORD_LOOKBACK_DAYS = int(os.getenv("QUERY_DISCORD_LOOKBACK_DAYS", "14")
 # cost / latency.
 QUERY_MAX_MESSAGES_PER_CHANNEL = int(os.getenv("QUERY_MAX_MESSAGES_PER_CHANNEL", "400"))
 
+# Standup notes — READ-ONLY context for QUERY MODE only; NEVER an input to ticket
+# creation. A separate rclone process syncs Gemini notes into a local folder; the
+# bot only reads local files and holds NO Google credential.
+# Path to that local folder (e.g. ./standups). Empty → standup features no-op.
+STANDUP_DIR = os.getenv("STANDUP_DIR", "").strip()
+# Optional shell command to force a sync on demand (e.g. "rclone copy ..."), run
+# before reading when a question is clearly about a recent/today standup. Empty →
+# read whatever is already on disk.
+STANDUP_SYNC_CMD = os.getenv("STANDUP_SYNC_CMD", "").strip()
+
+# Archive snapshot — a FROZEN local markdown file of past Done issues, used as a
+# READ-ONLY query-mode fallback when live Linear can't return an issue (archived /
+# not found). NEVER an input to ticket creation. Empty → archive features no-op.
+ARCHIVE_FILE = os.getenv("ARCHIVE_FILE", "").strip()
+
+# Holiday / leave channel — a Discord channel where people post OOO / on-leave
+# notes. Read-only context for query mode ("why was X delayed"); this channel is
+# NOT monitored for triage and never produces a ticket. 0/unset → disabled.
+HOLIDAY_CHANNEL_ID = int(os.getenv("HOLIDAY_CHANNEL_ID", "0") or "0")
+
 # If False, the bot creates Linear issues directly without the ✅/❌ approval step.
 REQUIRE_APPROVAL = _bool("REQUIRE_APPROVAL", default=True)
 
@@ -116,6 +164,24 @@ def validate() -> list[str]:
     missing = [k for k, v in required.items() if not v]
     if not MONITORED_CHANNEL_IDS:
         missing.append("MONITORED_CHANNEL_IDS")
+
+    # HARD RULE: the query channel must NOT be monitored for triage. If it
+    # accidentally overlaps a monitored channel, warn and let the bot treat it
+    # as query-only (skip triage there) rather than filing tickets from it.
+    if QUERY_CHANNEL_ID and QUERY_CHANNEL_ID in MONITORED_CHANNEL_IDS:
+        log.warning(
+            "QUERY_CHANNEL_ID=%s is also in MONITORED_CHANNEL_IDS — the query "
+            "channel must not be triaged. Treating it as query-only (no "
+            "classification/ticket creation will run there).",
+            QUERY_CHANNEL_ID,
+        )
+    if QUERY_CHANNEL_ID and QUERY_CHANNEL_ID == APPROVAL_CHANNEL_ID:
+        log.warning(
+            "QUERY_CHANNEL_ID=%s equals APPROVAL_CHANNEL_ID — approval embeds and "
+            "query replies will share one channel. Use separate channels to keep "
+            "the roles distinct.",
+            QUERY_CHANNEL_ID,
+        )
 
     if not ALLOWED_REPORTER_IDS and not ALLOWED_REPORTER_NAMES:
         log.warning(

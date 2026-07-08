@@ -24,6 +24,8 @@ from typing import Optional
 
 from anthropic import Anthropic
 
+from conventions import TEAM_CONVENTIONS
+
 log = logging.getLogger(__name__)
 
 # Loop bounds. ~5 tool rounds is enough for resolve-member → filter → detail
@@ -67,7 +69,10 @@ LINEAR_TOOLS = [
             "Fetch ONE issue in full by its identifier (e.g. 'NFT2-610'). Returns "
             "title, description, state{name,type}, assignee, labels, priority, estimate, "
             "dueDate, cycle, project, parent, children (sub-issues), createdAt, updatedAt, "
-            "url, and the latest comment. Prefer this whenever the user gives an explicit key."
+            "started_at, url, the latest comment, AND the timeline: state_history "
+            "([{state, type, entered_at, left_at}]) plus state_entered (first time each "
+            "state was entered) — so you can say when it moved to In Progress / Implemented "
+            "/ In Review. Prefer this whenever the user gives an explicit key."
         ),
         "input_schema": {
             "type": "object",
@@ -81,9 +86,25 @@ LINEAR_TOOLS = [
         "name": "get_issue_history",
         "description": (
             "Return the change history of ONE issue (state, assignee, priority, title, "
-            "due-date, estimate transitions) as timestamped events with the actor. This is "
-            "the ONLY way to answer 'when did the status change' / 'what changed'. Returns a "
-            "list of {at, actor, changes[]}, oldest first."
+            "due-date, estimate transitions) as timestamped events with the actor. Use for "
+            "'who changed what and when'. Returns a list of {at, actor, changes[]}, oldest "
+            "first. (For a plain state timeline, get_issue's state_history is usually enough.)"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Issue key, e.g. 'NFT2-610'."}
+            },
+            "required": ["identifier"],
+        },
+    },
+    {
+        "name": "list_comments",
+        "description": (
+            "Return ALL comments on ONE issue as [{author, createdAt, body}] in date order "
+            "(oldest first). Read the actual discussion to explain WHY something happened — "
+            "blockers, 'waiting on API', 're-tested, still fails', hand-offs. Use this "
+            "alongside get_issue's timeline for 'why was X delayed / what's the status of X'."
         ),
         "input_schema": {
             "type": "object",
@@ -122,6 +143,7 @@ LINEAR_TOOLS = [
                     "description": "Workflow state types. 'started'=in progress, 'completed'=done, etc.",
                 },
                 "created_after": {"type": "string", "description": "ISO-8601 timestamp; issues created on/after."},
+                "created_before": {"type": "string", "description": "ISO-8601 timestamp; issues created on/before."},
                 "updated_after": {"type": "string", "description": "ISO-8601 timestamp; issues updated on/after."},
                 "due_after": {"type": "string", "description": "Date YYYY-MM-DD; dueDate on/after (range start)."},
                 "due_before": {"type": "string", "description": "Date YYYY-MM-DD; dueDate on/before (range end)."},
@@ -170,9 +192,10 @@ def _system_prompt(*, requester_name: str, requester_linear_id: Optional[str], t
         '. When they say "me", "my", "mine", or "I", they mean themselves — use that '
         "identity/id directly instead of resolving a name."
     )
-    return f"""You answer questions about the NFThing / NFThing2.0 team's Linear
-issues, posted in Discord. NFThing2.0 is the team's product; issues use keys like
-NFT2-123. Today's date is {today} (UTC).
+    return TEAM_CONVENTIONS + "\n\n" + f"""You answer questions about the NFThing /
+NFThing2.0 team's Linear issues, posted in Discord, following the TEAM CONVENTIONS
+above. NFThing2.0 is the team's product; issues use keys like NFT2-123. Today's
+date is {today} (UTC).
 
 {who}
 
@@ -191,6 +214,34 @@ or move anything — only read. Answer by CALLING TOOLS, never by guessing:
   use list_issues. Resolve any person name to an id with resolve_member first,
   then pass assignee_id. Compute date ranges from today's date above.
 - For "sorted by priority / due date", pass the matching 'order' to list_issues.
+- Dates & comments are first-class. For "why was X delayed / what's the status /
+  timeline of X", read BOTH get_issue's timeline (createdAt, started_at, dueDate,
+  state_history / state_entered) AND list_comments (what people actually said —
+  blockers, "waiting on API", "re-tested, fails"), and — if a person or delay is
+  implicated — who_is_on_leave. Then EXPLAIN, citing concrete dates, e.g.:
+  "created 6 Jul, moved to In Progress 8 Jul, still not Implemented; a comment on
+  9 Jul notes a blocked API; Arun was on leave 2 Jul." For "overdue" / "due this
+  week" / "created before X", use list_issues' dueDate / created_before filters.
+  NEVER invent a date, comment, or event that isn't in the tool data.
+
+Person status — "what is X working on / up to" (orchestrate ALL sources into ONE
+reasoned answer, NOT a list dump):
+1. Linear (authoritative "actively on"): resolve_member(X), then
+   list_issues(assignee_id=<id>, state_types=["started"]) — In Progress / In Review
+   (and Implemented if that state exists) — noting dueDate and updatedAt. This is
+   the primary signal for what they're actively working on.
+2. Standup: read_standup (most recent) — the Next steps owned by X = what they
+   committed to / were assigned today (reflect what was actually said, not just
+   ticket state).
+3. Discord: recent_discord_activity(X) — recent posts, ESPECIALLY ones with
+   done_signal=true, which may mean an In-Progress ticket is actually finished.
+4. Leave: who_is_on_leave(around today's date) — is/was X off in the window?
+Then SYNTHESISE one answer: LEAD with what X is actively on (Linear In Progress +
+today's standup commitment). Note anything X signalled DONE in Discord that Linear
+hasn't caught up on. Flag if they're on leave. LABEL each fact's source inline
+(Linear / standup / Discord / leave) and cite dates. If sources DISAGREE (ticket
+says In Progress but Discord says "done"), SURFACE the discrepancy — don't pick
+silently. You only REPORT — never move the ticket (a separate path does that).
 
 Discord ↔ Linear linking (only if those tools are provided):
 - When a question spans BOTH systems — "which Discord message/report is behind
@@ -203,13 +254,54 @@ Discord ↔ Linear linking (only if those tools are provided):
   when a link exists. If no stored link exists, say so plainly: the bot only
   records links for issues it created or updated itself.
 
+Standup notes (only if those tools are provided) — READ-ONLY context, synced
+"Notes by Gemini" docs. NEVER treat them as Linear data or act on them:
+- "what did we decide this morning / today's standup / latest sync / action items
+  from standup" → read_standup (omit date for the most recent; AM/PM to filter).
+  Use list_standups to enumerate what's on file.
+- ALWAYS state freshness when you use standup data, e.g. "Latest standup on file:
+  AM sync 2026-07-07 (synced 10:47)." If the tool reports the note isn't found (or
+  today's isn't present even after a sync), SAY SO — never imply a standup didn't
+  happen or invent its contents.
+- next_steps carry owner_linear when the owner maps to a Linear user; use it to
+  connect an action item to that person, but don't invent a mapping that's null.
+
+Archive snapshot (only if the tool is provided) — a FROZEN file of past Done
+issues. Use search_archive ONLY as a fallback: if get_issue / search_issues can't
+find an issue the user referenced (it may be archived), try search_archive. When
+you use archive data you MUST append its 'provenance_label' (e.g. "(from archive
+snapshot, through 2026-07-07)") and never present it as live Linear — the snapshot
+knows nothing archived after its through-date.
+
+Leave / holiday (only if the tool is provided): for "why was X delayed", "was X
+around", or a stalled-work question, call who_is_on_leave (pass around_date when a
+specific day matters). Use it to explain gaps ("Arun was on leave 2026-07-02"), but
+don't over-claim causation — report what the leave notes actually say.
+
 Rules:
 - NEVER invent issues, identifiers, links, statuses, dates, or fields. Use only
   what the tools return. If a field isn't present, say it isn't set.
 - If nothing matches, say so plainly and briefly — don't pad.
-- Keep replies concise and Discord-friendly (GitHub-flavoured markdown). Link
-  issues as [NFT2-123](url) using the url from the tool result. For lists, one
-  bullet per issue. Stay well under 1500 characters.
+- When reporting status, use the lifecycle meaning from the conventions above:
+  "Implemented" = dev-done, deployable to FKTR, NOT yet QA'd; "In Review" = under
+  QA; "Done" = QA-signed-off. Never imply the bot changed a status here — this is
+  read-only.
+- OUTPUT FORMAT — keep it COMPACT and Discord-friendly; most answers should fit
+  in ONE message (under ~1800 characters). Follow these exactly:
+  - NO markdown headers (no #, ##, ###, ####). Use a short **bold label** or just
+    plain text to introduce a section.
+  - ONE LINE PER ISSUE, no bullet needed, in this shape:
+    `[NFT2-660](url) — Harsh — 1:1 DMs · Urgent · In Progress`
+    i.e. link · assignee · short title · priority · state — joined by " · ".
+    Omit any field that isn't set rather than writing "none".
+  - NO blank lines between items or sections — a single line break is enough.
+  - Link issues as [NFT2-123](url) using the url from the tool result.
+  - When you cite standup freshness, keep it to ONE compact line, e.g.
+    "Latest standup on file: AM sync 2026-07-07 (synced 10:47)."
+- If the answer would still run very long (more than ~15 issues / ~3 messages'
+  worth), DON'T dump everything: lead with the most relevant items (most recent
+  or highest priority) and end with a short line like "…and 12 more — narrow by
+  assignee/label/state to see them."
 - When a tool returns an error, briefly tell the user what failed; don't retry
   endlessly."""
 
@@ -364,6 +456,12 @@ class QueryEngine:
                     return {"error": "get_issue_history requires 'identifier'"}
                 return await self._linear.get_issue_history(ident)
 
+            if name == "list_comments":
+                ident = str(tool_input.get("identifier") or "").strip()
+                if not ident:
+                    return {"error": "list_comments requires 'identifier'"}
+                return await self._linear.list_comments(ident)
+
             if name == "list_issues":
                 order = str(tool_input.get("order") or "updatedAt")
                 if order not in ("updatedAt", "priority", "dueDate"):
@@ -377,6 +475,7 @@ class QueryEngine:
                     label_names=tool_input.get("labels") or None,
                     state_types=tool_input.get("state_types") or None,
                     created_after=tool_input.get("created_after") or None,
+                    created_before=tool_input.get("created_before") or None,
                     updated_after=tool_input.get("updated_after") or None,
                     due_after=tool_input.get("due_after") or None,
                     due_before=tool_input.get("due_before") or None,

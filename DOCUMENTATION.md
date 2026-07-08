@@ -88,7 +88,7 @@ value is missing.
 |---|---|
 | `DISCORD_TOKEN` | Bot token from the Discord Developer Portal. Requires the **MESSAGE CONTENT** privileged intent. |
 | `MONITORED_CHANNEL_IDS` | Comma-separated channel IDs to listen on. |
-| `APPROVAL_CHANNEL_ID` | Single channel ID where approval embeds are posted. |
+| `APPROVAL_CHANNEL_ID` | Single channel ID where approval embeds are posted and ✅/❌ handled. Approvals only — no query answering. |
 | `ANTHROPIC_API_KEY` | Claude API key used by the classifier. |
 | `LINEAR_API_KEY` | Linear personal API key. Used as the `Authorization` header verbatim. |
 | `LINEAR_TEAM_ID` | UUID of the Linear team to create issues in. (Note: the *UUID*, not the team key.) |
@@ -97,6 +97,7 @@ value is missing.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `QUERY_CHANNEL_ID` | _(empty)_ | Dedicated read-only query channel. In it, every non-bot human message is treated as a query (no @-mention needed); no triage/approvals run here. Empty → queries are answered via @-mention in `APPROVAL_CHANNEL_ID` (fallback). Must not overlap `MONITORED_CHANNEL_IDS`; if it does, startup warns and treats it as query-only. |
 | `CLASSIFIER_MODEL` | `claude-sonnet-4-6` | Anthropic model id. `claude-haiku-4-5-20251001` is the cheap default; `claude-opus-4-7` for highest quality. |
 | `MIN_MESSAGE_LENGTH` | `20` | Skip messages shorter than this, **unless** they carry an attachment (screenshots often have one-line captions). |
 | `MIN_CONFIDENCE` | `0.6` | Drop verdicts below this threshold. Raise to cut false positives. |
@@ -319,7 +320,7 @@ unless-stopped`) for production.
   application or `on_message` will never see text.
 - OAuth2 scopes: `bot`. Permissions: View Channels, Read Message History,
   Send Messages, Add Reactions.
-- The bot must be invited to *both* the monitored and approval channels.
+- The bot must be invited to the monitored, approval, **and** query channels.
 
 ### Required Linear setup
 

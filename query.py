@@ -14,7 +14,8 @@ will sit on top of. Errors are logged and swallowed; helpers return empty /
 None rather than raising (same convention as the read paths in linear_client).
 """
 import logging
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import discord
@@ -378,3 +379,235 @@ async def resolve_person(
         len(result["candidates"]),
     )
     return result
+
+
+# -- holiday / leave channel scan (read-only) --------------------------------
+
+# Freeform leave-message detector — tolerant, matches how people actually post.
+_LEAVE_RE = re.compile(
+    r"\b(ooo|o\.o\.o|out of (the )?office|on leave|taking leave|going on leave|"
+    r"day ?off|days ?off|off today|off tomorrow|be off|holiday|vacation|"
+    r"annual leave|pto|sick leave|sick today|on holiday|be away|be out)\b",
+    re.IGNORECASE,
+)
+# "Arun is on leave", "Ravi will be OOO", "Shreyansh: holiday Friday" → subject name.
+_LEAVE_SUBJECT_RE = re.compile(
+    r"^\s*@?(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b[^.\n]{0,30}?"
+    r"\b(is|are|will be|on|has|takes?|taking|going|won'?t)\b",
+)
+_MONTHS = {
+    m: i for i, m in enumerate(
+        ["jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"], start=1
+    )
+}
+_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_DAY_MONTH_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\b")
+_MONTH_DAY_RE = re.compile(r"\b([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\b")
+
+
+def _extract_leave_dates(text: str, ref: date) -> list[str]:
+    """Best-effort ISO dates from a freeform leave message. Handles explicit
+    YYYY-MM-DD, "2nd July" / "July 2", and today/tomorrow/yesterday relative to
+    the message date. Ambiguous relative phrasing is left to the note text."""
+    out: list[str] = []
+
+    def add(y, mo, d):
+        try:
+            out.append(date(y, mo, d).isoformat())
+        except ValueError:
+            pass
+
+    for y, mo, d in _ISO_DATE_RE.findall(text):
+        add(int(y), int(mo), int(d))
+    for d, mon in _DAY_MONTH_RE.findall(text):
+        mo = _MONTHS.get(mon[:3].lower())
+        if mo:
+            add(ref.year, mo, int(d))
+    for mon, d in _MONTH_DAY_RE.findall(text):
+        mo = _MONTHS.get(mon[:3].lower())
+        if mo:
+            add(ref.year, mo, int(d))
+
+    low = text.lower()
+    if re.search(r"\btoday\b", low):
+        out.append(ref.isoformat())
+    if re.search(r"\btomorrow\b", low):
+        out.append((ref + timedelta(days=1)).isoformat())
+    if re.search(r"\byesterday\b", low):
+        out.append((ref - timedelta(days=1)).isoformat())
+
+    # De-dupe, keep order.
+    seen: set[str] = set()
+    uniq = []
+    for d in out:
+        if d not in seen:
+            seen.add(d)
+            uniq.append(d)
+    return uniq
+
+
+def _is_leave_message(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or len(t) > 500:
+        return False
+    return bool(_LEAVE_RE.search(t))
+
+
+async def who_is_on_leave(
+    client: discord.Client,
+    *,
+    days: int = 45,
+    around_date: Optional[str] = None,
+    max_messages: int = 400,
+) -> list[dict]:
+    """Scan config.HOLIDAY_CHANNEL_ID (READ-ONLY) for OOO / on-leave posts over the
+    last `days` and extract {person, dates, note, posted_at, jump_url}. Freeform-
+    tolerant. When `around_date` (YYYY-MM-DD) is given, keep only entries whose
+    parsed dates include it — or, when a message carries no parseable date, that
+    were posted within ±3 days of it.
+
+    This channel is NOT monitored for triage — nothing here creates a ticket.
+    Returns [] when disabled/unreadable. Never raises."""
+    channel_id = getattr(config, "HOLIDAY_CHANNEL_ID", 0)
+    if not channel_id:
+        return []
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except discord.DiscordException as e:
+            log.info("[leave] holiday channel %s unreadable (%s)", channel_id, type(e).__name__)
+            return []
+
+    cutoff = _utcnow() - timedelta(days=max(1, int(days)))
+    target: Optional[date] = None
+    if around_date:
+        try:
+            target = date.fromisoformat(around_date.strip())
+        except ValueError:
+            target = None
+
+    out: list[dict] = []
+    try:
+        async for msg in channel.history(after=cutoff, limit=int(max_messages), oldest_first=False):
+            if getattr(msg.author, "bot", False):
+                continue
+            text = (msg.content or "").strip()
+            if not _is_leave_message(text):
+                continue
+            ref = msg.created_at.date()
+            dates = _extract_leave_dates(text, ref)
+            # Prefer a named subject ("Arun is on leave"); else the poster.
+            subj = _LEAVE_SUBJECT_RE.match(text)
+            person = subj.group("name").strip() if subj else _display(msg.author)
+            note = text if len(text) <= 240 else text[:237] + "…"
+            out.append(
+                {
+                    "person": person,
+                    "dates": dates,
+                    "note": note,
+                    "posted_at": msg.created_at.isoformat(),
+                    "jump_url": msg.jump_url,
+                }
+            )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning("[leave] cannot read holiday channel %s: %s", channel_id, type(e).__name__)
+        return []
+
+    if target is not None:
+        kept = []
+        for e in out:
+            if e["dates"]:
+                if target.isoformat() in e["dates"]:
+                    kept.append(e)
+            else:
+                try:
+                    posted = datetime.fromisoformat(e["posted_at"]).date()
+                    if abs((posted - target).days) <= 3:
+                        kept.append(e)
+                except ValueError:
+                    pass
+        out = kept
+
+    log.info("[leave] %d leave message(s) (days=%d around=%s)", len(out), days, around_date)
+    return out
+
+
+# -- person recent Discord activity (read-only, for the reasoned status path) --
+
+# Phrasing that signals an in-progress item may actually be finished — used to
+# cross-check Discord against a still-"In Progress" Linear ticket.
+_DONE_SIGNAL_RE = re.compile(
+    r"\b(done|fixed|deployed|shipped|resolved|merged|released|completed|"
+    r"pushed( it)? live|it'?s live|live now|good to go|ready for qa)\b",
+    re.IGNORECASE,
+)
+
+
+def is_done_signal(text: str) -> bool:
+    """True if a message reads like a completion signal ("done", "deployed", …)."""
+    return bool(_DONE_SIGNAL_RE.search(text or ""))
+
+
+async def person_recent_messages(
+    client: discord.Client,
+    *,
+    linear,
+    name: str,
+    days: int = config.QUERY_DISCORD_LOOKBACK_DAYS,
+) -> dict:
+    """Resolve `name` to a Discord identity and return their recent monitored-
+    channel messages (newest first), each flagged with `done_signal`. Read-only.
+
+    Returns {person, ambiguous, candidates, messages:[{channel, timestamp, text,
+    jump_url, done_signal}]}. On an ambiguous name it returns the candidates and no
+    messages, so the engine can ask which person. Never raises."""
+    try:
+        resolution = await resolve_person(name, linear=linear, client=client)
+    except Exception:
+        log.exception("[query.person_recent] resolve_person raised for %r", name)
+        resolution = {"ambiguous": False, "candidates": [], "discord_user": None, "linear_user": None}
+
+    if resolution.get("ambiguous"):
+        return {
+            "person": name,
+            "ambiguous": True,
+            "candidates": resolution.get("candidates", []),
+            "messages": [],
+        }
+
+    du = resolution.get("discord_user") or {}
+    lu = resolution.get("linear_user") or {}
+    scan_id = du.get("id")
+    scan_name = None if scan_id else (du.get("display_name") or name)
+
+    try:
+        msgs = await scan_recent_messages(
+            client, author_id=scan_id, author_name=scan_name, days=max(1, int(days))
+        )
+    except Exception:
+        log.exception("[query.person_recent] scan_recent_messages raised for %r", name)
+        msgs = []
+
+    out: list[dict] = []
+    for m in msgs[:25]:
+        ts = m.get("timestamp")
+        text = (m.get("text") or "").strip()
+        snippet = text[:300] + ("…" if len(text) > 300 else "")
+        out.append(
+            {
+                "channel": m.get("channel"),
+                "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                "text": snippet,
+                "jump_url": m.get("jump_url"),
+                "done_signal": is_done_signal(text),
+            }
+        )
+
+    return {
+        "person": du.get("display_name") or lu.get("displayName") or name,
+        "ambiguous": False,
+        "candidates": [],
+        "messages": out,
+    }

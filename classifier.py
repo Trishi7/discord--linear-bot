@@ -24,6 +24,8 @@ from typing import Optional
 
 from anthropic import Anthropic
 
+from conventions import TEAM_CONVENTIONS
+
 log = logging.getLogger(__name__)
 
 
@@ -55,11 +57,12 @@ Output STRICT JSON only (no preamble, no markdown fences) with this schema:
   "confidence":          0.0-1.0
 }
 
-Category definitions:
-- "bug":         something is broken or not behaving as expected.
-- "feature":     build or add something new that does not yet exist.
-- "improvement": a tweak to existing behaviour — perf, UX, polish, refactor.
+Category definitions (see TEAM CONVENTIONS above for the authoritative version):
+- "feature":     a NEW screen/flow/capability that does not exist yet — needs new endpoints or a design sprint; driven by a business/PRD/advertiser decision.
+- "improvement": a change to something that ALREADY exists — uses existing APIs or minor additions; triggered by analytics, user feedback, or a bug.
+- "bug":         a defect — broken or not behaving as expected.
 - "noise":      chit-chat, acks, questions, plain status updates — nothing to do.
+Decision test: if it needs a NEW Linear Project it's a feature; if it fits as a change to existing work it's an improvement.
 
 needs_triage:
 - If a message is plausibly actionable but you're unsure which category fits, pick your best-guess category AND set needs_triage=true.
@@ -77,17 +80,19 @@ status_signal (set to non-"none" ONLY when clearly stated in the thread):
 - "cannot_reproduce": "can't reproduce", "not a bug", "works for me".
 - Otherwise → "none".
 
-area_labels:
-- Use "BE", "FE", or "UI" only when the message clearly points there. Otherwise [].
+area_labels (the system label showing WHERE a fix lives):
+- "BE" = logic/API error; "FE" = wrong frontend behaviour or cosmetic (spacing/colour/font/layout); "UI" = a state never designed / edge case missing from design.
+- For a BUG, ALWAYS include the single best system label (BE/FE/UI). If you genuinely can't tell, pick your best guess AND set needs_triage=true.
+- For non-bugs, include a system label only when the message clearly points there; otherwise [].
 
 mentioned_assignees:
 - Discord display names or @-handles called out as owners/targets, preserved in mention order. [] if none.
 
-Priority guidance:
-- urgent: production down, data loss, security, blocking many users.
-- high:   significant degradation, blocks a workflow, customer-facing.
-- medium: default for clear actionable items without urgency.
-- low:    nice-to-have, cosmetic, easily worked around.
+Priority guidance (severity → Linear priority):
+- "urgent" (P0 Blocking): crash, user can't complete a flow, data loss, payment/withdrawal failure.
+- "high"   (P1 Major):    core flow broken but a workaround exists.
+- "low"    (P2 Minor):    visual glitch, copy error, non-blocking edge case.
+- "medium": use when it's clearly actionable but you're unsure whether it's P1 or P2.
 
 Confidence guidance:
 - Be honest. Short or ambiguous messages get low confidence even if you can pattern-match a category.
@@ -195,17 +200,21 @@ If a `category` is present (e.g. "Bug"), narrow the whole answer to that categor
 mention only matching issues / messages, and reflect it in the header (e.g.
 "**<Person> — recent bug reports**").
 
-Write GitHub-flavoured markdown. Header line first:
-**<Person> — what they're working on**   (adjust wording to source/category)
+Write COMPACT, Discord-friendly GitHub-flavoured markdown — a chat reply, not a
+report. NO markdown headers (no #, ##, ###). Use short **bold labels**. Keep the
+whole thing under ~1800 characters and prefer ONE message. First line is a short
+bold label, e.g. **<Person> — working on** (adjust wording to source/category).
 
 Linear section (ONLY when source is "linear" or "both"):
-**Working on (Linear):**
-- One bullet per issue: `IDENTIFIER` — <title> — _<status>_ — <url>
+**Linear:**
+- ONE LINE PER ISSUE, no blank lines, in this shape:
+  [IDENTIFIER](url) — <short title> · <priority> · <status>
+  Omit a field that isn't set rather than writing "none".
 - If there are no Linear issues, write exactly: _nothing in Linear_
 
 Discord section (ONLY when source is "discord" or "both"):
-**Recent Discord activity (last N days):**
-- A 1–3 sentence natural-language summary of what they've been posting (deploys,
+**Discord (last N days):**
+- A 1–2 sentence natural-language summary of what they've been posting (deploys,
   blockers, questions, PRs, decisions). Weave in jump links to the 1–3 most
   relevant messages inline, e.g. "shipped the payout fix ([msg](<jump_url>))".
 - Do NOT dump raw message logs. Summarise.
@@ -214,10 +223,12 @@ Discord section (ONLY when source is "discord" or "both"):
 Hard rules:
 - NEVER show a section for a source that is not in `source`. A Discord-only answer
   must contain no Linear block whatsoever, and vice versa.
+- NO blank lines between items or sections — a single line break is enough.
 - Use ONLY identifiers, titles, statuses, and URLs present in the Linear data.
   Never fabricate a link or an issue.
 - Use ONLY jump_url values present in the Discord data. Never invent a link.
-- Keep it tight — a chat reply, not a report. Stay well under 1500 characters.
+- If there are many Linear issues, lead with the most relevant (highest priority
+  / most recently updated), list at most ~12, and end with "…and N more".
 - If a coverage note is provided in the data, add it as a short final italic line.
 - Output the reply text only — no preamble, no code fences.
 """
@@ -302,7 +313,7 @@ class Classifier:
                 self._client.messages.create,
                 model=self._model,
                 max_tokens=600,
-                system=SYSTEM_PROMPT,
+                system=TEAM_CONVENTIONS + "\n\n" + SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_content}],
             )
         except Exception:

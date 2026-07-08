@@ -32,12 +32,22 @@ _PRIORITY_SORT_RANK = {1: 0, 2: 1, 3: 2, 4: 3, 0: 4}
 # Closed set of label names the bot is allowed to apply.
 _ALLOWED_LABEL_NAMES = {"BE", "FE", "Feature", "Bug", "Improvement", "UI"}
 
-# Classifier status_signal → Linear workflow state TYPE.
-_SIGNAL_TO_STATE_TYPE = {
-    "resolved": "completed",
-    "in_progress": "started",
-    "cannot_reproduce": "canceled",
+# Classifier status_signal → target Linear workflow state NAME (team convention).
+# Match by NAME, not type: "In Progress", "Implemented", and "In Review" all share
+# the "started" type here, so type matching can't distinguish them.
+#   - "resolved"        → at most "Implemented" (dev-done, not tested). Falls back
+#                         to comment-only if the team has no such state.
+#   - "in_progress"     → "In Progress".
+#   - "cannot_reproduce"→ no mapping → comment-only (Canceled is a PM decision).
+# The bot MUST NEVER set Done/Released — see _FORBIDDEN_STATE_* guards.
+SIGNAL_TO_STATE_NAME = {
+    "resolved": "Implemented",
+    "in_progress": "In Progress",
 }
+# Hard safety rails: the bot never moves an issue into a completed/canceled-type
+# state, nor any state named like these, regardless of the mapping above.
+_FORBIDDEN_STATE_TYPES = {"completed", "canceled"}
+_FORBIDDEN_STATE_NAMES = {"done", "released"}
 
 
 _CREATE_ISSUE = """
@@ -125,6 +135,7 @@ query GetIssue($id: String!) {
     dueDate
     createdAt
     updatedAt
+    startedAt
     state { name type }
     labels { nodes { name } }
     assignee { displayName name email }
@@ -133,6 +144,9 @@ query GetIssue($id: String!) {
     project { name }
     parent { identifier title }
     children(first: 50) { nodes { identifier title } }
+    history(first: 100) {
+      nodes { createdAt fromState { name type } toState { name type } }
+    }
     comments(last: 1) {
       nodes { body createdAt user { displayName name } }
     }
@@ -162,6 +176,17 @@ query IssueHistory($id: String!) {
         fromEstimate
         toEstimate
       }
+    }
+  }
+}
+"""
+
+_LIST_COMMENTS = """
+query IssueComments($id: String!) {
+  issue(id: $id) {
+    identifier
+    comments(first: 100) {
+      nodes { body createdAt user { displayName name } }
     }
   }
 }
@@ -223,6 +248,57 @@ def _assigned_node_to_dict(node: dict) -> dict:
     }
 
 
+def _build_state_history(
+    history_nodes: Optional[list], created_at: Optional[str] = None
+) -> Optional[list[dict]]:
+    """Reconstruct the state timeline from IssueHistory transitions:
+    [{state, type, entered_at, left_at}], oldest first. `left_at` is the next
+    transition's timestamp (None for the current state). The INITIAL state (the
+    issue's state before its first recorded transition — often set at creation
+    with no transition event) is seeded from the first event's `fromState`,
+    entered at `created_at`, so a "created straight into In Progress" issue still
+    shows that leg. Returns None when history wasn't loaded, [] when empty."""
+    if history_nodes is None:
+        return None
+    trans = []
+    for n in history_nodes:
+        n = n or {}
+        to = n.get("toState")
+        if to and to.get("name"):
+            fr = n.get("fromState") or {}
+            trans.append(
+                {
+                    "from": fr.get("name"),
+                    "from_type": fr.get("type"),
+                    "to": to["name"],
+                    "to_type": to.get("type"),
+                    "at": n.get("createdAt"),
+                }
+            )
+    trans.sort(key=lambda e: e["at"] or "")
+
+    timeline: list[dict] = []
+    if trans and trans[0]["from"]:
+        timeline.append(
+            {
+                "state": trans[0]["from"],
+                "type": trans[0]["from_type"],
+                "entered_at": created_at,
+                "left_at": trans[0]["at"],
+            }
+        )
+    for i, t in enumerate(trans):
+        timeline.append(
+            {
+                "state": t["to"],
+                "type": t["to_type"],
+                "entered_at": t["at"],
+                "left_at": trans[i + 1]["at"] if i + 1 < len(trans) else None,
+            }
+        )
+    return timeline
+
+
 def _issue_node_to_dict(node: dict) -> dict:
     """Normalise an Issue GraphQL node into the dict shape callers expect."""
     labels = [
@@ -261,6 +337,16 @@ def _issue_node_to_dict(node: dict) -> dict:
         if c and c.get("identifier")
     ]
 
+    # State timeline (only `_GET_ISSUE` selects `history`). Also expose a
+    # first-entered map so the engine can cite "moved to In Progress on <date>".
+    history_nodes = (node.get("history") or {}).get("nodes") if node.get("history") else None
+    state_history = _build_state_history(history_nodes, node.get("createdAt"))
+    state_entered = None
+    if state_history:
+        state_entered = {}
+        for h in state_history:
+            state_entered.setdefault(h["state"], h["entered_at"])
+
     return {
         "id": node.get("id"),
         "identifier": node.get("identifier"),
@@ -286,6 +372,9 @@ def _issue_node_to_dict(node: dict) -> dict:
         "children": children,
         "created_at": node.get("createdAt"),
         "updated_at": node.get("updatedAt"),
+        "started_at": node.get("startedAt"),
+        "state_history": state_history,
+        "state_entered": state_entered,
         "latest_comment": latest_comment,
     }
 
@@ -607,42 +696,65 @@ class LinearClient:
         return result["comment"]
 
     async def set_issue_status(self, issue_id: str, signal: str) -> Optional[dict]:
-        """Move `issue_id` into the team's first workflow state of the type implied
-        by `signal`:
+        """Move `issue_id` toward the team-convention state NAMED for `signal`:
 
-            resolved          → first "completed" state
-            in_progress       → first "started"   state
-            cannot_reproduce  → first "canceled"  state
+            resolved          → "Implemented"  (at most — dev-done, not tested)
+            in_progress       → "In Progress"
+            cannot_reproduce  → no-op (comment only; Canceled is a PM decision)
             anything else     → no-op
 
+        Matched by state NAME (case-insensitive): "In Progress", "Implemented",
+        and "In Review" all share the "started" type here, so type matching can't
+        tell them apart. If the named state doesn't exist on the team we fall back
+        to comment-only (no move). The bot NEVER moves an issue into a
+        completed/canceled-type state or one named done/released — a hard guard,
+        so resolution signals can't accidentally close QA-gated work.
+
         Returns the updated issue dict, or None when there was nothing to do
-        (unrecognised signal, no state of the target type on the team, or an
-        API failure). Logs and swallows errors — never raises.
+        (unmapped signal, missing/forbidden target state, or an API failure).
+        Logs and swallows errors — never raises.
         """
         log.info("[linear.set_issue_status] step 1/3: issue=%s signal=%s", issue_id, signal)
-        state_type = _SIGNAL_TO_STATE_TYPE.get(signal)
-        if state_type is None:
+        target_name = SIGNAL_TO_STATE_NAME.get(signal)
+        if target_name is None:
             log.info(
-                "[linear.set_issue_status] signal %r has no state-type mapping; no-op",
+                "[linear.set_issue_status] signal %r maps to no state (comment-only); no-op",
                 signal,
             )
             return None
 
         log.info(
-            "[linear.set_issue_status] step 2/3: locating first state of type %r",
-            state_type,
+            "[linear.set_issue_status] step 2/3: locating state named %r",
+            target_name,
         )
         try:
             states = await self.list_team_states()
         except Exception:
             log.exception("[linear.set_issue_status] could not load team states; no-op")
             return None
-        target = next((s for s in states if s.get("type") == state_type), None)
+        want = target_name.strip().lower()
+        target = next(
+            (s for s in states if (s.get("name") or "").strip().lower() == want), None
+        )
         if target is None:
             log.warning(
-                "[linear.set_issue_status] team %s has no state of type %r; no-op",
+                "[linear.set_issue_status] team %s has no state named %r; "
+                "comment-only fallback (no move)",
                 self._team_id,
-                state_type,
+                target_name,
+            )
+            return None
+
+        # Hard safety rail: never move into a completed/canceled or done/released
+        # state, even if the mapping/name somehow pointed there.
+        if (
+            target.get("type") in _FORBIDDEN_STATE_TYPES
+            or (target.get("name") or "").strip().lower() in _FORBIDDEN_STATE_NAMES
+        ):
+            log.error(
+                "[linear.set_issue_status] REFUSING to move %s into forbidden state "
+                "%r (type=%s) — the bot never sets Done/Released",
+                issue_id, target.get("name"), target.get("type"),
             )
             return None
 
@@ -1032,6 +1144,40 @@ class LinearClient:
         )
         return events
 
+    async def list_comments(self, id_or_identifier: str) -> list[dict]:
+        """All comments on one issue as [{author, createdAt, body}] in date order
+        (oldest first) — so the engine can read what actually happened (blockers,
+        "waiting on API", "re-tested, fails"). [] on error / not found. Read-only,
+        never raises. Bodies are capped so a chatty issue can't blow the payload."""
+        ident = str(id_or_identifier or "").strip()
+        log.info("[linear.list_comments] step 1/2: id=%r", ident)
+        if not ident:
+            return []
+        try:
+            data = await self._gql(_LIST_COMMENTS, {"id": ident})
+        except Exception:
+            log.exception("[linear.list_comments] failed; returning []")
+            return []
+        nodes = ((data.get("issue") or {}).get("comments") or {}).get("nodes") or []
+        out: list[dict] = []
+        for n in nodes:
+            if not n:
+                continue
+            user = n.get("user") or {}
+            body = (n.get("body") or "").strip()
+            if len(body) > 1200:
+                body = body[:1197] + "…"
+            out.append(
+                {
+                    "author": user.get("displayName") or user.get("name"),
+                    "createdAt": n.get("createdAt"),
+                    "body": body,
+                }
+            )
+        out.sort(key=lambda c: c.get("createdAt") or "")
+        log.info("[linear.list_comments] step 2/2: %d comment(s)", len(out))
+        return out
+
     async def list_issues_query(
         self,
         *,
@@ -1039,6 +1185,7 @@ class LinearClient:
         label_names: Optional[list[str]] = None,
         state_types: Optional[list[str]] = None,
         created_after: Optional[str] = None,
+        created_before: Optional[str] = None,
         updated_after: Optional[str] = None,
         due_after: Optional[str] = None,
         due_before: Optional[str] = None,
@@ -1064,8 +1211,13 @@ class LinearClient:
             f["state"] = {"type": {"in": list(state_types)}}
         if label_names:
             f["labels"] = {"some": {"name": {"in": list(label_names)}}}
+        created: dict = {}
         if created_after:
-            f["createdAt"] = {"gte": created_after}
+            created["gte"] = created_after
+        if created_before:
+            created["lte"] = created_before
+        if created:
+            f["createdAt"] = created
         if updated_after:
             f["updatedAt"] = {"gte": updated_after}
         due: dict = {}
