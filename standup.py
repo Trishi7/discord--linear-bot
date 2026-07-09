@@ -65,7 +65,7 @@ _TRAILER_RE = re.compile(
 # Phrases that mean "I care about the freshest / today's standup" → sync first.
 _WANTS_RECENT_RE = re.compile(
     r"\b(today|todays|this\s+morning|this\s+afternoon|this\s+evening|tonight|"
-    r"just\s+now|latest|most\s+recent|stand[\s-]?up|this\s+sync|todays\s+sync)\b",
+    r"just\s+now|latest|most\s+recent|stand[\s-]?up|sync)\b",
     re.IGNORECASE,
 )
 
