@@ -104,7 +104,7 @@ QUERY_SYSTEM_PROMPT = """You parse Discord questions for the NFThing / membrane
 engineering team into structured filters. You ONLY parse — you never fetch,
 create, or modify anything.
 
-There are THREE kinds of question:
+There are FOUR kinds of question:
 - person_activity: "what is <person> working on / up to / handling these days",
   "what's <person> been doing" — a status check on ONE teammate. This blends the
   person's Linear assignments with their recent Discord activity.
@@ -117,11 +117,17 @@ There are THREE kinds of question:
 - issue_list: anything about the team's Linear ISSUES as a GROUP — lists, filters,
   searches. E.g. "list my open bugs", "issues Sid raised in the last 2 weeks",
   "what's open with the Bug label".
+- standup: anything about the team's STANDUP / SYNC notes — "what was discussed in
+  today's / yesterday's standup", "what happened in the AM/PM sync", "what did we
+  decide this morning", "standup summary", "action items from standup", "what did
+  <person> commit to today". A status check on a MEETING NOTE, not on Linear.
+  When the question also names a person ("what did Ravi commit to today"), it is
+  STILL a standup question (intent="standup"), not person_activity.
 
 Output STRICT JSON only (no preamble, no fences) with this schema:
 {
   "is_query":     true | false,
-  "intent":       "person_activity" | "issue_status" | "issue_list" | "none",
+  "intent":       "person_activity" | "issue_status" | "issue_list" | "standup" | "none",
   "source":       "discord" | "linear" | "both",  // which system to look at; "both" if unscoped
   "person":       string,            // person_activity: the teammate's name; "" otherwise
   "subject":      string,            // issue_status: free-text description of the ONE issue; "" otherwise
@@ -135,8 +141,13 @@ Output STRICT JSON only (no preamble, no fences) with this schema:
 }
 
 Rules:
-- is_query=true ONLY if the message is a person_activity or issue_list question.
-  Greetings, bug reports, off-topic chat → is_query=false, intent="none".
+- is_query=true whenever the message is a QUESTION the bot could answer from Linear
+  or the standup notes — i.e. ANY person_activity, issue_status, issue_list, OR
+  standup question. Set is_query=false (intent="none") ONLY for things that are not
+  answerable questions at all: greetings/thanks/chit-chat, a NEW bug/feature report
+  being filed, or off-topic messages. When unsure whether a question is answerable,
+  prefer is_query=true and let the downstream tools decide — do NOT gate a real
+  question out.
 - intent="person_activity" when the question asks what a specific PERSON is working
   on / up to / handling / has been doing / mentioned / said. Set `person` to that
   name (preserve casing); leave issue-filter fields (identifier/search_term/
@@ -158,12 +169,20 @@ Rules:
 - intent="issue_list" for questions about issues as a GROUP (lists, filters,
   searches across many issues). Use reporter/labels/states/window_days/
   search_term as applicable. Leave `person`="" and `subject`="".
+- intent="standup" for questions about the STANDUP / SYNC notes (see the standup
+  kind above). Key words: "standup", "stand-up", "sync", "kick-off", "wrap-up",
+  "AM sync", "PM sync", "this morning's meeting", "what did we decide/discuss".
+  If a person is named, still use intent="standup" and set `person` to that name so
+  the downstream reader can filter the action items to them. window_days: "today"=1,
+  "yesterday"=1 (the reader resolves the exact date from wording).
 - source: which system the question is scoped to. Infer from wording:
     "on discord", "in the channel", "posted", "mentioned" / "said" / "wrote"  → "discord"
     "in linear", "assigned to", "ticket", "issue", "status of", "label"        → "linear"
+    "standup", "sync", "kick-off", "wrap-up" (i.e. intent="standup")           → "both"
     no explicit source                                                         → "both"
   When BOTH a Discord verb and a Linear noun appear, prefer the explicit scope the
   asker is standing in (e.g. "what bugs did X mention on discord" → "discord").
+  A standup question is NEVER "discord" — always use "both" so it reaches the reader.
 - "I" / "my" / "me" → reporter="me" (issue_list). A named person → reporter="<Name>".
 - Time phrases → window_days: "today"=1, "this week"=7, "last 2 weeks"=14,
   "this month"=30, no time reference → 0.
@@ -464,7 +483,7 @@ class Classifier:
 
         is_query = bool(parsed.get("is_query", False))
         intent = parsed.get("intent", "none")
-        if intent not in {"person_activity", "issue_status", "issue_list", "none"}:
+        if intent not in {"person_activity", "issue_status", "issue_list", "standup", "none"}:
             intent = "none"
 
         source = str(parsed.get("source") or "both").strip().lower()

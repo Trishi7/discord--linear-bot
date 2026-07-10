@@ -13,6 +13,7 @@ posted to the same channel instead.
 """
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -75,6 +76,89 @@ CONTEXT_HISTORY_LIMIT = 200
 # Cap on images sent to the classifier per request — keeps payloads sane.
 MAX_IMAGES_PER_CLASSIFY = 8
 
+# Cross-message dedup: how far back to look for a matching pending approval /
+# tracked issue in the same channel, and how "clear" a title match must be to
+# suppress a second embed or redirect a create into a comment. The threshold is
+# deliberately HIGH — per team convention a wrong comment/merge is worse than a
+# near-duplicate ticket, so we only act on an obvious match and otherwise create.
+DEDUP_WINDOW_HOURS = 24
+TITLE_CLEAR_MATCH = 0.66
+
+# Low-signal words dropped before comparing report titles by key terms. Stored in
+# STEMMED form (see _stem) so e.g. "fails"/"failing"/"failed" all collapse here.
+_TITLE_STOPWORDS = {
+    "the", "a", "an", "is", "are", "wa", "were", "be", "to", "of", "in", "on",
+    "for", "and", "or", "with", "when", "not", "no", "it", "thi", "that", "then",
+    "do", "doe", "cant", "cannot", "wont", "isnt", "after", "before", "from",
+    "issue", "bug", "error", "problem", "fail", "broken", "pleas", "help", "wrong",
+}
+
+
+def _stem(tok: str) -> str:
+    """Very light suffix stripping so morphological variants unify
+    (uploading→upload, crashes→crash, DMs→dm). Not linguistically correct — just
+    enough to match how the same bug gets worded two different ways."""
+    for suf in ("ing", "ed", "es", "s"):
+        if len(tok) > len(suf) + 1 and tok.endswith(suf):
+            return tok[: -len(suf)]
+    return tok
+
+
+def _normalize_title(s: str) -> str:
+    """Lower-case, strip punctuation, collapse whitespace — a stable key for
+    comparing two report titles."""
+    s = re.sub(r"[^a-z0-9\s]", " ", (s or "").lower())
+    return " ".join(s.split())
+
+
+def _title_key_terms(s: str) -> set:
+    """Significant STEMMED tokens of a title (drop stopwords + 1-char tokens).
+    Two-char domain tokens like 'ui'/'be'/'fe'/'dm' are kept."""
+    out = set()
+    for raw in _normalize_title(s).split():
+        if len(raw) < 2:
+            continue
+        t = _stem(raw)
+        if t and t not in _TITLE_STOPWORDS:
+            out.add(t)
+    return out
+
+
+def _title_match_score(a: str, b: str) -> float:
+    """0..1 similarity between two report titles. 1.0 on normalised equality;
+    otherwise the max of Jaccard overlap and (weighted) containment of the smaller
+    key-term set in the larger — so "DM images fail to upload" and "images not
+    uploading in DMs" score highly while unrelated titles score low. A single
+    shared term can never clear the bar (containment counts only at >= 2 overlap),
+    so incidental topic words ('Pulse', 'button') don't fuse unrelated reports."""
+    na, nb = _normalize_title(a), _normalize_title(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    ta, tb = _title_key_terms(a), _title_key_terms(b)
+    if not ta or not tb:
+        return 0.0
+    inter = len(ta & tb)
+    if not inter:
+        return 0.0
+    jaccard = inter / len(ta | tb)
+    smaller = min(len(ta), len(tb))
+    # Containment rewards "A's terms are mostly ⊆ B's", but only with real overlap
+    # (>= 2 shared terms) AND a non-trivial smaller set (>= 3 terms) — otherwise a
+    # generic two-word title ("Login page") would fuse into any longer title that
+    # happens to contain both words.
+    if inter >= 2 and smaller >= 3:
+        return max(jaccard, (inter / smaller) * 0.9)
+    return jaccard
+
+
+def _titles_clearly_match(a: str, b: str) -> bool:
+    """True only on an OBVIOUS same-report match (>= TITLE_CLEAR_MATCH). Kept
+    conservative on purpose: uncertainty must fall through to 'create', never to
+    a wrong merge/comment."""
+    return _title_match_score(a, b) >= TITLE_CLEAR_MATCH
+
 
 def _display(user) -> str:
     return (
@@ -82,6 +166,31 @@ def _display(user) -> str:
         or getattr(user, "name", None)
         or str(user)
     )
+
+
+# Interrogative / imperative openers that mark a message as a question or command
+# the read-only engine should attempt. Used only as a LAST-RESORT guard so a real
+# question never falls through to the generic help text because the parser
+# under-classified it (e.g. a phrasing it didn't recognise as a standup query).
+_QUESTION_LEAD_RE = re.compile(
+    r"^\s*(what|who|whose|whom|when|where|why|which|how|is|are|was|were|do|does|"
+    r"did|can|could|should|would|will|has|have|had|show|list|tell|give|find|"
+    r"lookup|look\s+up|search|status|update|remind|any)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_question(text: str) -> bool:
+    """Heuristic: does this read like a question/command worth handing to the
+    read-only engine? Deliberately liberal — the engine answers honestly ("I
+    couldn't find…") when nothing applies, so a false positive is cheap while a
+    false negative wrongly bounces the user with the help text."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if "?" in t:
+        return True
+    return bool(_QUESTION_LEAD_RE.match(t))
 
 
 def _is_reporter_allowed(author) -> bool:
@@ -463,7 +572,16 @@ class TriageBot(discord.Client):
 
         # F) Approval gate.
         if config.REQUIRE_APPROVAL:
-            await self._post_for_approval(message, plan)
+            # STAGE-1 DEDUP: fold a duplicate report into an existing pending
+            # approval instead of posting a second embed (a create plan only).
+            merged_into = await self._maybe_merge_into_pending(message, plan)
+            if merged_into is not None:
+                log.info(
+                    "[on_message] msg=%s merged into pending approval=%s; no new embed",
+                    message.id, merged_into,
+                )
+            else:
+                await self._post_for_approval(message, plan)
         else:
             await self._execute_immediately(message, plan)
 
@@ -656,6 +774,28 @@ class TriageBot(discord.Client):
                 "comment_body": comment_body,
             }
 
+        # Path A2: SAME-CHANNEL follow-up that isn't a Discord reply. A clear title
+        # match to an issue a recent same-channel message already tracks means this
+        # is another mention of it — comment instead of opening a duplicate. A clear
+        # match overrides the classifier's is_new_issue guess (a plain follow-up is
+        # usually mis-read as "new").
+        chan_issue = await self._find_channel_linkage(message, verdict)
+        if chan_issue:
+            log.info(
+                "[plan] channel linkage hit → comment on %s '%s'",
+                chan_issue.get("identifier"), chan_issue.get("title"),
+            )
+            comment_body = _format_comment_body(message, needs_triage=needs_triage)
+            return {
+                **base,
+                "kind": "comment_dup",
+                "target_issue_id": chan_issue["id"],
+                "target_issue_identifier": chan_issue.get("identifier"),
+                "target_issue_title": chan_issue.get("title"),
+                "target_issue_url": chan_issue.get("url"),
+                "comment_body": comment_body,
+            }
+
         # Path B: heading to create — check for an open duplicate first.
         log.info("[plan] step 3/3: no parent linkage applied; checking for open dup")
         dup = await self._find_open_duplicate(verdict["title"])
@@ -750,12 +890,13 @@ class TriageBot(discord.Client):
         return None
 
     async def _find_open_duplicate(self, title: str) -> Optional[dict]:
-        """Conservative duplicate detector: normalised-title equality against
-        an OPEN issue. Falls through to "no dup" on any error or ambiguity —
-        we'd rather create a near-duplicate than silently dump a real new
-        issue onto an unrelated old one."""
-        title_norm = " ".join((title or "").lower().split())
-        if not title_norm:
+        """Conservative duplicate detector: search Linear (open issues first) and
+        return the single best OPEN issue whose title CLEARLY matches `title`
+        (>= TITLE_CLEAR_MATCH, not just exact equality — the same bug is often
+        worded differently by different reporters). Falls through to "no dup" on
+        any error or ambiguity — we'd rather create a near-duplicate than dump a
+        real new issue onto an unrelated old one."""
+        if not _normalize_title(title):
             return None
 
         # search_issues already swallows its own errors → []
@@ -775,20 +916,73 @@ class TriageBot(discord.Client):
             log.debug("[duplicate] team has no open-typed states; skipping dup")
             return None
 
+        best: Optional[dict] = None
+        best_score = 0.0
         for hit in hits:
-            hit_title_norm = " ".join((hit.get("title") or "").lower().split())
-            if hit_title_norm != title_norm:
-                continue
             if hit.get("state") not in open_names:
                 continue
+            score = _title_match_score(title, hit.get("title") or "")
+            if score >= TITLE_CLEAR_MATCH and score > best_score:
+                best, best_score = hit, score
+        if best is not None:
             log.info(
-                "[duplicate] clear match: %s '%s' state=%s",
-                hit.get("identifier"),
-                hit.get("title"),
-                hit.get("state"),
+                "[duplicate] clear match (score=%.2f): %s '%s' state=%s",
+                best_score, best.get("identifier"), best.get("title"), best.get("state"),
             )
-            return hit
+            return best
         log.debug("[duplicate] %d hits, none clear-matched an open issue", len(hits))
+        return None
+
+    async def _find_channel_linkage(
+        self, message: discord.Message, verdict: dict
+    ) -> Optional[dict]:
+        """STAGE-2 DEDUP. A follow-up that ISN'T a Discord reply (a plain new
+        message in the channel) can still be about an already-tracked issue.
+        Scan recently tracked messages in the SAME channel (last
+        DEDUP_WINDOW_HOURS) and, on a CLEAR title match, return the OPEN issue
+        they're linked to — resolved live so we have its human identifier / url /
+        state. Conservative: only a clear match, and only while the issue is still
+        open. Returns the issue dict (id, identifier, url, title, state) or None."""
+        title = verdict.get("title") or ""
+        if not _normalize_title(title):
+            return None
+        try:
+            linked = self.db.list_recent_linked(message.channel.id, self._dedup_since())
+        except Exception:
+            log.exception("[plan] list_recent_linked failed")
+            return None
+
+        checked: set = set()
+        for row in linked:
+            internal_id = row.get("linear_issue_id")
+            if not internal_id or internal_id in checked:
+                continue
+            cls = row.get("classification") or {}
+            stored_title = cls.get("title") or cls.get("target_issue_title") or ""
+            if not _titles_clearly_match(title, stored_title):
+                continue
+            checked.add(internal_id)
+            # Resolve live to confirm it's still OPEN and to get identifier/url.
+            try:
+                issue = await self.linear.get_issue(internal_id)
+            except Exception:
+                log.exception("[plan] get_issue failed for channel-linked %s", internal_id)
+                continue
+            if not issue:
+                continue
+            if issue.get("state_type") not in _OPEN_STATE_TYPES:
+                log.info(
+                    "[plan] channel-linked %s matched but state=%s is closed; not redirecting",
+                    issue.get("identifier"), issue.get("state"),
+                )
+                continue
+            log.info(
+                "[dedup] STAGE-2 channel linkage clear-match → comment on %s "
+                "(score=%.2f, %r ~ %r)",
+                issue.get("identifier"),
+                _title_match_score(title, stored_title), title, stored_title,
+            )
+            return issue
         return None
 
     async def _resolve_assignee_for_plan(
@@ -926,6 +1120,114 @@ class TriageBot(discord.Client):
         return "\n".join(parts)
 
     # -- approval flow ----------------------------------------------------
+
+    def _dedup_since(self) -> str:
+        """SQLite 'YYYY-MM-DD HH:MM:SS' UTC lower bound for the dedup window."""
+        return (
+            datetime.now(timezone.utc) - timedelta(hours=DEDUP_WINDOW_HOURS)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+    async def _maybe_merge_into_pending(
+        self, source: discord.Message, plan: dict
+    ) -> Optional[int]:
+        """STAGE-1 DEDUP. Before posting a NEW approval embed for a create plan,
+        look for an existing PENDING approval in the SAME channel (last
+        DEDUP_WINDOW_HOURS) whose proposed report clearly matches this one. On a
+        match we do NOT post a second embed: record this message as merged into
+        that approval (so ✅ later links it to the same issue and it's never
+        re-classified) and annotate the existing embed ("also reported by @X").
+        Returns the canonical approval_message_id on a merge, else None.
+
+        Only create plans are deduped here — a comment plan already targets a real
+        issue, so it can't spawn a duplicate ticket."""
+        if plan.get("kind") not in ("create", "create_needs_triage"):
+            return None
+        try:
+            pendings = self.db.list_recent_pending(source.channel.id, self._dedup_since())
+        except Exception:
+            log.exception("[dedup] list_recent_pending failed; posting normally")
+            return None
+
+        title = plan.get("title") or ""
+        for p in pendings:
+            cls = p.get("classification") or {}
+            if cls.get("kind") not in ("create", "create_needs_triage"):
+                continue
+            other_title = cls.get("title") or ""
+            if not _titles_clearly_match(title, other_title):
+                continue
+            approval_id = p.get("approval_message_id")
+            log.info(
+                "[dedup] STAGE-1 SUPPRESS embed: msg=%s matches pending approval=%s "
+                "(score=%.2f, %r ~ %r) — merging, NOT posting a second embed",
+                source.id, approval_id, _title_match_score(title, other_title),
+                title, other_title,
+            )
+            try:
+                self.db.record_merged(
+                    message_id=source.id,
+                    channel_id=source.channel.id,
+                    classification=plan,
+                    approval_message_id=int(approval_id),
+                )
+            except Exception:
+                log.exception("[dedup] record_merged failed for msg=%s", source.id)
+            await self._annotate_also_reported(int(approval_id), source, plan)
+            return int(approval_id)
+        return None
+
+    async def _annotate_also_reported(
+        self, approval_message_id: int, source: discord.Message, plan: dict
+    ) -> None:
+        """Add/extend an 'Also reported by' field on an existing approval embed so
+        the reviewer can see the duplicate report was folded in. Best-effort."""
+        channel = self.get_channel(config.APPROVAL_CHANNEL_ID)
+        if channel is None:
+            return
+        try:
+            msg = await channel.fetch_message(approval_message_id)
+        except discord.DiscordException:
+            log.exception("[dedup] couldn't fetch approval embed %s to annotate", approval_message_id)
+            return
+        if not msg.embeds:
+            return
+        embed = msg.embeds[0]
+        reporter = plan.get("reporter_name", "?")
+        jump = plan.get("source_jump_url") or getattr(source, "jump_url", "") or ""
+        mention = f"@{reporter}"
+        entry = mention + (f" ([jump]({jump}))" if jump else "")
+
+        field_name = "Also reported by"
+        idx = next(
+            (i for i, f in enumerate(embed.fields) if f.name == field_name), None
+        )
+        if idx is None:
+            embed.add_field(name=field_name, value=entry[:1024], inline=False)
+        else:
+            old = embed.fields[idx].value or ""
+            if mention in old:  # same reporter already noted — nothing to add
+                return
+            embed.set_field_at(
+                idx, name=field_name, value=(old + "\n" + entry)[:1024], inline=False
+            )
+        try:
+            await msg.edit(embed=embed)
+        except discord.DiscordException:
+            log.exception("[dedup] failed to edit approval embed %s", approval_message_id)
+
+    def _comment_body_from_plan(self, plan: dict) -> str:
+        """Build a Linear comment body from a create plan when we redirect that
+        create onto an existing issue (idempotency re-check). Reuses the plan's
+        already-rendered report body so nothing the reporter said is lost."""
+        reporter = plan.get("reporter_name", "?")
+        jump = plan.get("source_jump_url") or ""
+        parts = [f"**@{reporter}** reported what looks like the same issue:", ""]
+        desc = (plan.get("description") or "").strip()
+        if desc:
+            parts.append(desc if len(desc) <= 3500 else desc[:3497] + "…")
+        if jump and jump not in desc:
+            parts += ["", f"_From Discord: {jump}_"]
+        return "\n".join(parts)
 
     async def _post_for_approval(
         self, source: discord.Message, plan: dict
@@ -1235,6 +1537,37 @@ class TriageBot(discord.Client):
         return None
 
     async def _exec_create(self, plan: dict) -> Optional[dict]:
+        # STAGE-1 RE-CHECK (idempotency): between proposal and this ✅, a sibling
+        # report may already have produced an issue (e.g. its approval was clicked
+        # first). If an OPEN issue now clearly matches this title, comment on it
+        # instead of creating a duplicate — and say so in the confirmation.
+        try:
+            dup = await self._find_open_duplicate(plan.get("title") or "")
+        except Exception:
+            log.exception("[exec-create] dup re-check raised; proceeding to create")
+            dup = None
+        if dup:
+            log.info(
+                "[dedup] STAGE-1 REDIRECT create→comment: open issue %s matched at "
+                "approval time; commenting instead of creating a second issue",
+                dup.get("identifier"),
+            )
+            try:
+                comment = await self.linear.add_comment(
+                    dup["id"], self._comment_body_from_plan(plan)
+                )
+            except (LinearError, Exception):
+                log.exception("[exec-create] redirect add_comment failed for %s", dup.get("identifier"))
+                return None
+            return {
+                "linear_issue_id": dup["id"],
+                "issue": dup,
+                "redirected": True,
+                "redirect_identifier": dup.get("identifier"),
+                "redirect_url": dup.get("url"),
+                "comment_url": comment.get("url"),
+            }
+
         log.info(
             "[exec-create] step 1/2: title=%r labels=%s assignee=%s desc_len=%d",
             plan.get("title"),
@@ -1314,6 +1647,14 @@ class TriageBot(discord.Client):
     def _format_result_message(self, plan: dict, result: dict) -> str:
         kind = plan["kind"]
         if kind in ("create", "create_needs_triage"):
+            if result.get("redirected"):
+                ident = result.get("redirect_identifier") or "?"
+                url = result.get("redirect_url") or ""
+                link = f"[{ident}]({url})" if url else ident
+                return (
+                    f"💬 An issue for this already existed — commented on **{link}** "
+                    f"instead of creating a duplicate."
+                )
             issue = result.get("issue", {}) or {}
             ident = issue.get("identifier") or "?"
             url = issue.get("url") or ""
@@ -1469,29 +1810,53 @@ class TriageBot(discord.Client):
         if parsed is None:
             log.warning("[query] parse_query returned None; letting report path try")
             return False
-        if not parsed.get("is_query"):
-            log.info("[query] LLM said not a Linear question; letting report path try")
-            return False
-
         intent = parsed.get("intent")
         source = (parsed.get("source") or "both").strip().lower()
         if source not in ("discord", "linear", "both"):
             source = "both"
+
+        if not parsed.get("is_query"):
+            # The parser didn't recognise this as an answerable question. The help
+            # text is a LAST resort — if the message still reads like a question,
+            # hand it to the read-only engine (it holds every read tool plus
+            # standup / leave / archive and will honestly say when nothing applies)
+            # rather than bouncing the user. Only genuine non-questions fall through
+            # to the report path / help text.
+            if _looks_like_question(text):
+                log.info(
+                    "[query] parser said not-a-query but text is question-shaped "
+                    "→ route=engine (fallback) msg=%s q=%r",
+                    message.id, text[:120],
+                )
+                await self._handle_linear_engine_query(message, text)
+                log.info("[query] DONE msg=%s (engine, question-heuristic)", message.id)
+                return True
+            log.info(
+                "[query] not a query and not question-shaped msg=%s; letting report path try",
+                message.id,
+            )
+            return False
+
         log.info("[query] step 3/4: intent=%s source=%s parsed=%s", intent, source, parsed)
 
-        # ROUTING — Discord-scoped questions keep the existing Discord scan +
-        # identity-resolution path (person activity from monitored-channel
-        # history). Everything that touches Linear — issue status, issue lists,
-        # AND the Linear side of a person question — now flows through the
-        # tool-driven engine, which decides for itself which read-only Linear
-        # tools to call. No more per-intent Linear handlers.
-        if source == "discord":
+        # ROUTING — ONLY a Discord-scoped PERSON question keeps the dedicated local
+        # Discord scan + identity-resolution path (person activity from
+        # monitored-channel history). EVERYTHING else — issue status/lists, STANDUP
+        # notes, leave, links, and unscoped person questions — flows through the
+        # read-only tool-driven engine, which decides which read tools to call.
+        # Standup questions in particular MUST reach the engine: it is the only path
+        # that holds read_standup / list_standups.
+        if source == "discord" and intent == "person_activity":
             person = (
                 parsed.get("person")
                 or parsed.get("reporter")
                 or parsed.get("search_term")
                 or ""
             ).strip()
+            log.info(
+                "[query] route=discord-scan intent=%s person=%r msg=%s",
+                intent, person, message.id,
+            )
             await self._handle_person_activity(
                 message,
                 {**parsed, "intent": "person_activity", "source": "discord", "person": person},
@@ -1499,7 +1864,9 @@ class TriageBot(discord.Client):
             log.info("[query] DONE msg=%s (discord scan)", message.id)
             return True
 
-        # source == "linear" or "both" → tool-driven Linear engine.
+        log.info(
+            "[query] route=engine intent=%s source=%s msg=%s", intent, source, message.id
+        )
         await self._handle_linear_engine_query(message, text)
         log.info("[query] DONE msg=%s (engine)", message.id)
         return True
@@ -1771,9 +2138,26 @@ class TriageBot(discord.Client):
             latest_date, mtime = await asyncio.to_thread(standup.freshness)
             return {"latest_date_on_disk": latest_date, "synced_file_mtime": mtime}
 
+        # Distinguishes "standup access isn't configured" (STANDUP_DIR unset OR the
+        # folder is missing) from "configured but no note for that day". The former
+        # must be reported as not-configured, never as "nothing was discussed".
+        async def _not_configured() -> Optional[dict]:
+            ok = await asyncio.to_thread(standup.is_configured)
+            if ok:
+                return None
+            return {
+                "enabled": False,
+                "configured": False,
+                "note": (
+                    "Standup access isn't configured (STANDUP_DIR is unset or the "
+                    "folder is missing) — I can't read standup notes."
+                ),
+            }
+
         async def _list_standups(inp: dict):
-            if not config.STANDUP_DIR:
-                return {"enabled": False, "note": "Standup notes aren't configured (STANDUP_DIR unset)."}
+            not_cfg = await _not_configured()
+            if not_cfg:
+                return not_cfg
             try:
                 days = int(inp.get("days") or 14)
             except (TypeError, ValueError):
@@ -1781,19 +2165,25 @@ class TriageBot(discord.Client):
             notes = await asyncio.to_thread(standup.list_standups, max(1, days))
             return {
                 "enabled": True,
+                "configured": True,
                 "standups": notes,
                 "freshness": await _freshness_note(),
             }
 
         async def _read_standup(inp: dict):
-            if not config.STANDUP_DIR:
-                return {"enabled": False, "note": "Standup notes aren't configured (STANDUP_DIR unset)."}
+            not_cfg = await _not_configured()
+            if not_cfg:
+                return not_cfg
 
-            # Sync-on-demand: only for clearly recent/today questions, and only
-            # when a sync command is configured. Best-effort — read regardless.
-            synced = False
+            # Sync-on-demand: only for clearly recent/today questions, and only when
+            # a sync command is configured. Best-effort — we read regardless, and we
+            # tell the model whether the sync RAN and whether it SUCCEEDED so a
+            # failed/timed-out sync can be reported as "data may be stale".
+            sync_ran = False
+            sync_ok = False
             if config.STANDUP_SYNC_CMD and standup.wants_recent(question_text):
-                synced = await asyncio.to_thread(
+                sync_ran = True
+                sync_ok = await asyncio.to_thread(
                     standup.sync_now, config.STANDUP_SYNC_CMD
                 )
 
@@ -1805,12 +2195,16 @@ class TriageBot(discord.Client):
             if not note:
                 return {
                     "enabled": True,
+                    "configured": True,
                     "found": False,
-                    "sync_attempted": synced,
+                    "sync_ran": sync_ran,
+                    "sync_ok": sync_ok,
                     "freshness": freshness,
                     "note": (
                         "No matching standup on file"
-                        + (" (even after an on-demand sync)" if synced else "")
+                        + (" (even after an on-demand sync)" if sync_ran else "")
+                        + (" — the on-demand sync FAILED, so data may be stale"
+                           if sync_ran and not sync_ok else "")
                         + "."
                     ),
                 }
@@ -1822,11 +2216,23 @@ class TriageBot(discord.Client):
                 enriched.append({**step, "owner_linear": owner_linear})
             note = {**note, "next_steps": enriched}
 
+            # Which sessions exist for the SAME day, so the reply can say "the other
+            # sync is also on file" when no session was explicitly requested.
+            sessions_that_day = await asyncio.to_thread(
+                standup.sessions_on, note.get("date")
+            )
+            chosen_session = (note.get("session") or "").upper()
+            other_sessions = [s for s in sessions_that_day if s != chosen_session]
+
             return {
                 "enabled": True,
+                "configured": True,
                 "found": True,
-                "sync_attempted": synced,
+                "sync_ran": sync_ran,
+                "sync_ok": sync_ok,
                 "freshness": freshness,
+                "sessions_available_that_day": sessions_that_day,
+                "other_sessions_available": other_sessions,
                 "standup": note,
             }
 
@@ -1853,12 +2259,20 @@ class TriageBot(discord.Client):
                 "schema": {
                     "name": "read_standup",
                     "description": (
-                        "Read one standup note. Returns its summary, decisions/aligned bullets, "
-                        "and next_steps as [{owner_name, task, owner_linear}], plus 'freshness' "
-                        "(latest_date_on_disk, synced_file_mtime). Omit 'date' for the most "
-                        "recent; optionally filter by 'session' (AM/PM). When you use this data "
-                        "you MUST state what's on file (e.g. 'Latest standup on file: AM sync "
-                        "2026-07-07'); if today's isn't present, say so — don't imply none happened."
+                        "Read ONE standup note. Returns {found, standup:{date, session, summary, "
+                        "decisions[], next_steps:[{owner_name, task, owner_linear}]}}, plus "
+                        "'freshness' (latest_date_on_disk, synced_file_mtime), 'sync_ran'/'sync_ok' "
+                        "(did an on-demand sync run and succeed), and — when no session was "
+                        "requested — 'other_sessions_available' (e.g. ['AM'] means the AM sync for "
+                        "the SAME day is also on file; mention it). If configured=false, standup "
+                        "access isn't set up — say so, don't claim nothing was discussed. Pass a "
+                        "'date' (YYYY-MM-DD) computed from today's date for 'today'/'yesterday'/a "
+                        "weekday/an explicit date; omit it for the most recent on file. Filter by "
+                        "'session' (AM=kick-off/morning, PM=wrap-up/evening) when the user names one. "
+                        "When you use this data you MUST state which note you read (e.g. 'AM sync, "
+                        "2026-07-08') and the freshness line. If found=false, say the requested "
+                        "standup isn't on file yet — NEVER answer from a different day's note as if "
+                        "it were the one asked for, and never imply a standup didn't happen."
                     ),
                     "input_schema": {
                         "type": "object",

@@ -349,6 +349,26 @@ def freshness(*, standup_dir: Optional[str] = None) -> tuple[Optional[str], Opti
     return (latest_date, newest_mtime)
 
 
+def is_configured(*, standup_dir: Optional[str] = None) -> bool:
+    """True when standup access is usable: STANDUP_DIR is set AND the folder
+    exists. Distinguishes 'not configured' (say so) from 'configured but no note
+    for that day' (found=false) so callers never conflate the two."""
+    return bool(_resolve_dir(standup_dir))
+
+
+def sessions_on(date_iso: str, *, standup_dir: Optional[str] = None) -> list[str]:
+    """Return the sessions (['AM','PM'], or ['AM'] etc.) that have a note on file
+    for the given YYYY-MM-DD. Empty when disabled / none on file. Lets a reply
+    mention 'the other sync is also available' after reading one of them."""
+    out: list[str] = []
+    for n in list_standups(days=3650, standup_dir=standup_dir):
+        if n.get("date") == date_iso:
+            s = (n.get("session") or "").upper()
+            if s and s not in out:
+                out.append(s)
+    return sorted(out)
+
+
 def wants_recent(question: str) -> bool:
     """True when the question is clearly about a recent/today standup, so a
     sync-on-demand is worth running before reading."""
