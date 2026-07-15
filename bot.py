@@ -1710,6 +1710,19 @@ class TriageBot(discord.Client):
         old behaviour, never stall or lose a report."""
         if not config.COS_CLARIFY_ENABLED:
             return False
+        # SCOPE: clarifying questions are for the REPORT/TRIAGE path only — building a
+        # good ticket — NEVER for a question the user asked the bot. If this message was
+        # directed at the bot as a query (dedicated query channel, or an explicit
+        # @-mention) it must be ANSWERED best-effort by the engine, never bounced back
+        # with "narrow it down". Such a message only reaches here if it was mis-routed as
+        # a report; refuse to interrogate it.
+        if self._is_query_trigger(message) or _looks_like_question(message.content):
+            log.info(
+                "[clarify] msg=%s is a query/question, not a report — not clarifying "
+                "(query mode answers best-effort)",
+                message.id,
+            )
+            return False
         if not clarify.is_clarifiable(plan):
             log.debug(
                 "[clarify] msg=%s plan kind=%s is not a create; not asking",
@@ -3216,6 +3229,24 @@ class TriageBot(discord.Client):
         )
         await self._safe_reply(message, reply)
 
+    async def _engine_no_progress_reply(
+        self, message: discord.Message, *, text: str, history: list
+    ) -> None:
+        """The engine held every read tool and still returned nothing. On the FIRST turn
+        (no history) that warrants a one-time persona nudge offering what she can look
+        into. On a FOLLOW-UP (there IS history) we've already engaged — do NOT re-ask the
+        user to narrow as if re-judging vagueness; reply honestly that the search came up
+        empty and only THEN offer a pointer, so a thread is never stuck in a narrow-it-down
+        loop (one clarification per thread, maximum)."""
+        if history:
+            await self._safe_reply(
+                message,
+                "I checked but couldn't find anything concrete on that just now. If it's a "
+                "specific issue key, person, or feature name, drop it in and I'll pull it up.",
+            )
+            return
+        await self._send_social_reply(message, "unclear", text=text)
+
     async def _handle_query(self, message: discord.Message) -> bool:
         """Handle a message addressed to the bot.
 
@@ -3291,7 +3322,7 @@ class TriageBot(discord.Client):
                     "(persona, last resort)",
                     message.id,
                 )
-                await self._send_social_reply(message, "unclear", text=text)
+                await self._engine_no_progress_reply(message, text=text, history=history)
                 return True
             log.warning(
                 "[route] msg=%s parse_query gave no verdict and text isn't "
@@ -3319,16 +3350,26 @@ class TriageBot(discord.Client):
             return True
 
         # REPORT — a bug/feature being FILED at the bot. That's the report pipeline's
-        # job, not the engine's. In a query-only channel there IS no report pipeline,
-        # so fall through to the persona nudge at the bottom instead.
-        if kind == "report" and not query_only:
+        # job, not the engine's. BUT a follow-up in an ongoing Q&A (recent query history
+        # in this channel) or a plainly question-shaped message must be ANSWERED, not
+        # filed and clarified — the parser can misread a bare subject like "the DMs
+        # feature" as a report. Those fall through to the engine below. In a query-only
+        # channel there is no report pipeline anyway.
+        if (
+            kind == "report"
+            and not query_only
+            and not history
+            and not _looks_like_question(text)
+        ):
             log.info("[route] msg=%s type=report → route=report-pipeline", message.id)
             return False
 
         # QUESTION — recognised OR merely question-shaped OR tagged a question by the
-        # parser even though it couldn't map an intent. All of these go to the engine:
-        # if any tool could plausibly answer it, let the engine try.
-        if kind == "question" or parsed.get("is_query") or _looks_like_question(text):
+        # parser even though it couldn't map an intent, OR a follow-up in an ongoing Q&A
+        # (recent query history — a short subject reply like "the DMs feature" continues
+        # the conversation and must be answered, never re-questioned). All go to the
+        # engine: if any tool could plausibly answer it, let the engine try.
+        if kind == "question" or parsed.get("is_query") or _looks_like_question(text) or history:
             # The ONE dedicated path: a Discord-scoped PERSON question keeps the local
             # Discord scan + identity resolution (person activity from monitored-channel
             # history). Everything else — issue status/lists, STANDUP notes, leave,
@@ -3369,7 +3410,7 @@ class TriageBot(discord.Client):
                 "(persona, last resort)",
                 message.id,
             )
-            await self._send_social_reply(message, "unclear", text=text)
+            await self._engine_no_progress_reply(message, text=text, history=history)
             log.info("[query] DONE msg=%s (capability)", message.id)
             return True
 

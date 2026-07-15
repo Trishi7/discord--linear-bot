@@ -393,6 +393,13 @@ A CoS who gets *"login is broken"* doesn't file a half-complete ticket and doesn
 invent the missing half — she asks the reporter the **few things she genuinely needs**
 and files it properly once she has the answer. That's this path.
 
+**Scope: this is the REPORT/TRIAGE path only — it never fires on a question.** A message
+the user directed at the bot as a query (dedicated query channel, or an explicit @-mention)
+is always answered best-effort by the read-only engine; query mode never asks you to narrow
+a question or hand over a ticket key as a *precondition* to answering (it may offer to
+narrow *after* it answers). Clarifying questions apply solely to a NEW bug/feature being
+filed.
+
 After the plan is built but **before** the approval embed is posted, the bot asks the
 model whether anything **essential** is missing. The test is: *does this gap actually
 block creating a good ticket?* It asks only for:
