@@ -6,6 +6,41 @@ Linear: create a new issue, comment on an existing one (optionally with a
 status transition), or do nothing. Behind `REQUIRE_APPROVAL` the proposed
 action is gated on a ✅/❌ react in a private channel.
 
+It acts as a **Chief of Staff** (named via `COS_NAME`, default *Mira*), which means
+it has some agency about *when to speak*, not just what to answer:
+
+- **It asks instead of guessing** (`COS_CLARIFY_ENABLED`). A report missing something
+  a ticket genuinely can't do without — a bug with no repro, no expected-vs-actual,
+  unclear which feature/screen, scope too vague to action — gets the few genuinely-needed
+  questions **bundled into ONE message** (up to `COS_CLARIFY_MAX_QUESTIONS`), @-mentioning
+  the **original reporter** in the channel. She waits briefly for a late screenshot before
+  asking, asks **at most once**, and on timeout files it flagged **needs-triage** rather
+  than nagging. The plan is *parked* and proposed (with the answer) once replied to.
+- **It follows up on what people promised** (`COS_FOLLOWUP_ENABLED`). "I'll confirm the
+  DM dates in an hour", "DMs going live tomorrow", "I'll deploy it" — each becomes a
+  tracked **open thread**; when it ages past due the bot nudges that person in-channel.
+  Unanswered clarifications are the second nudge source. One **unified policy** governs
+  both: at most once per `COS_NUDGE_WINDOW_HOURS`, at most `COS_NUDGE_MAX_ATTEMPTS` times,
+  then it stops, records the non-response, and tells the **PMs once**.
+- **It chases gaps up a two-level ladder** (`COS_TAG_ASSIGNEE_ENABLED`,
+  `COS_ESCALATE_ENABLED`). It audits the team's **active** Linear issues (In Progress /
+  Implemented-a.k.a.-awaiting-QA / In Review — `COS_ACTIVE_STATE_NAMES`), **reads the
+  comments before it tags** (`COS_CHECK_COMMENTS_ENABLED` — a comment may already answer
+  the gap, or reveal a blocker that belongs with the PMs), and asks **the person who can
+  actually answer**: the **assignee** for a data gap on their own issue (a plain missing
+  date *always* goes here), the **PMs** for a call that's above an IC.
+- **It can close the loop on a deadline** (`COS_UPDATE_DEADLINE_ENABLED`, **opt-in, off by
+  default**). After tagging about a missing due date it watches for the answer — a Discord
+  reply, an issue comment, or the standup notes — then **sets the due date and comments the
+  source**. This is the **one** thing it writes to Linear, tightly scoped (never a status
+  change or reassignment) and **dry-run by default** (`COS_UPDATE_DEADLINE_DRY_RUN`).
+
+Everything else is **read/propose only on Linear**. Clarifying can *delay and enrich* a
+proposal but never files anything by itself; follow-up and the escalation ladder
+**never create, assign, or transition a ticket** — their only output is a Discord message
+asking a human. The **sole** exception is the opt-in deadline write above (comment + due
+date only). **She asks people; the one thing she'll change is a due date, on your say-so.**
+
 Also exposes a **read-only QUERY MODE** when @-mentioned. Linear questions are
 answered by a **tool-driven loop** (`query_engine.py`): the bot's own Claude call
 is handed a set of read-only Linear tools and decides which to call, so it answers
@@ -91,12 +126,48 @@ you're confident in the classifier's precision in your specific channels.
 
 ```
             ┌─────────────────── REPORT PATH ──────────────────────────┐
-Discord ──▶ Pre-filter ──▶ LLM classifier ──▶ Plan ──▶ Approval embed ──▶ ✅ Linear
- channels   (channel,      (Claude, strict        │      (or auto)
-            allowlist,      JSON)                 │
-            length)                               │
-                                                  └── SQLite (dedup, audit,
-                                                      message→issue mapping)
+Discord ──▶ Pre-filter ──▶ LLM classifier ──▶ Plan ──▶ Clarify? ──▶ Approval ──▶ ✅ Linear
+ channels   (channel,      (Claude, strict        │     anything     embed
+            allowlist,      JSON)                 │     essential   (or auto)
+            length)                               │     missing?
+                                                  │        │
+                                                  │        ├─ no  ─────▶ propose now
+                                                  │        └─ yes ─▶ ask ONE question,
+                                                  │                  PARK the plan
+                                                  │                    ├─ answered ─▶ re-plan
+                                                  │                    │              w/ answer
+                                                  │                    │              ─▶ propose
+                                                  │                    └─ timed out ─▶ propose
+                                                  │                                   parked plan
+                                                  └── SQLite (dedup, audit, message→issue
+                                                      mapping, parked plans, open threads)
+
+            ┌─── PROACTIVE FOLLOW-UP (open threads — never touches Linear) ───┐
+Discord ──▶ commitment? ──▶ open thread ──▶ sweeper ──────▶ nudge in-channel
+ channels   "I'll confirm    (who, what,     (every 30m)     "any update?"
+             in an hour"      due, link)     due + unanswered?
+                                                             ✅ or a reply ──▶ closed
+                                                             max 2 nudges ──▶ stale
+
+            ┌─── ESCALATION LADDER (READS Linear; writes to Discord, + 1 opt-in scoped write) ─┐
+Linear ───▶ gap audit ──▶ read comments ──┬─ comment already answers it ─▶ don't tag
+ (ACTIVE    (sweeper)     before tagging   │   (missing date? feed the loop-closer)
+ issues:                                   │
+ In Progress/                              ├─ data gap on their own issue ─▶ @ASSIGNEE (L1)
+ Implemented/                              │   no due date (ALWAYS L1) ·     "NFT2-591 has no
+ In Review)                                │   no repro · vague scope         due date… when?"
+                                           │
+                                           └─ above an IC ─────────────────▶ @PMs (level 2)
+                                               stuck-and-silent · unowned ·  "NFT2-660 stuck 5d,
+                                               comment-evidenced blocker      no explanation…"
+
+                        rate limit: same person + same issue + same reason
+                                    → at most once per 24h (fails CLOSED)
+
+            ┌─── CLOSE THE LOOP (opt-in write: COS_UPDATE_DEADLINE_ENABLED, dry-run default) ─┐
+tagged ───▶ deadline watch ──▶ answer from: Discord reply · issue comment · standup notes
+ assignee   (per issue)        └─▶ parse a date ──▶ SET due date + COMMENT source
+                                                    (never status / assignee)
 
             ┌─────────────────── QUERY MODE (read-only) ───────────────┐
 @mention  ──▶ parse_query (LLM) ──┬─ source=discord ──▶ resolve_person
@@ -124,14 +195,21 @@ discord-linear-bot/
 ├── main.py             # entry point
 ├── config.py           # env loading + allowlist parsing
 ├── conventions.py      # TEAM_CONVENTIONS — team playbook, injected into both LLM prompts
-├── db.py               # SQLite state store (+ read-only message↔issue linkage)
+├── db.py               # SQLite state store (+ read-only message↔issue linkage, parked plans, open threads)
 ├── classifier.py       # report classifier + query router (parse_query) + activity synthesiser
+│                       #   + assess_clarification (gap check) + detect_commitment + followup_nudge
+├── persona.py          # the Chief-of-Staff identity + every prompt she SPEAKS through (voice only)
+├── memory.py           # short-term, in-memory per-channel query context (follow-up questions)
+├── clarify.py          # clarifying questions: the gate + fallback question text
+├── followups.py        # open threads: commitment prefilter, due-time math, fallback nudge text
+├── escalation.py       # the two-level ladder: what's worth chasing, and WHO to ask (pure logic)
 ├── linear_client.py    # Linear GraphQL client (labels, states, members, issues, history, comments)
 ├── query_engine.py     # tool-driven read-only Linear query engine (tool-use loop)
 ├── standup.py          # read-only parser for rclone-synced Gemini standup notes
 ├── archive.py          # read-only index of the frozen Done-issues snapshot (fallback)
 ├── query.py            # read-only person resolution + Discord activity scan + leave scan
-└── bot.py              # Discord bot: on_message, on_raw_message_edit, on_raw_reaction_add, query mode
+└── bot.py              # Discord bot: on_message, on_raw_message_edit, on_raw_reaction_add,
+                        #   query mode, clarify/resume, commitment tracking, the periodic sweeper
 ```
 
 ## Team conventions (`conventions.py`)
@@ -308,6 +386,251 @@ preferred behaviour: comment and leave the status change to the PM). Transitions
 only apply when commenting on the parent thread issue — a dup-by-search `comment`
 is never auto-transitioned. The approval embed / confirmation states the actual
 outcome ("moved to **In Progress**" vs "status change left to the PM").
+
+## Chief of Staff: clarifying questions (`COS_CLARIFY_ENABLED`)
+
+A CoS who gets *"login is broken"* doesn't file a half-complete ticket and doesn't
+invent the missing half — she asks the reporter the **few things she genuinely needs**
+and files it properly once she has the answer. That's this path.
+
+After the plan is built but **before** the approval embed is posted, the bot asks the
+model whether anything **essential** is missing. The test is: *does this gap actually
+block creating a good ticket?* It asks only for:
+
+- a **bug with no reproduction path** (nothing about what was done, where, on what),
+- a **bug with no expected-vs-actual** (you can't tell what "correct" looks like),
+- **which feature / screen / area** it's about, when the report doesn't say and it can't tell,
+- **scope too vague to action** — *"the dashboard is weird"*, *"payments feel off"*,
+- **no owner and nothing implying one**.
+
+It deliberately does **not** ask about anything **cosmetic or reasonably inferable**
+(priority, labels, the obvious owner for an area — that's its job, not yours), when the
+report is already actionable, when the answer is already in the thread, when a screenshot
+already shows the repro, or when the item is flagged **needs-triage** (unassigned-pending-triage
+is the team's convention, **not** a gap). The bias is **toward filing**, and a gap the
+model isn't at least `COS_CLARIFY_MIN_CONFIDENCE` sure about is ignored.
+
+**Bundled into ONE message, never an interrogation across several.** If more than one thing
+is genuinely blocking, it asks for up to `COS_CLARIFY_MAX_QUESTIONS` (default 3) of them as
+a short numbered list; if the rest can be inferred, it asks only the single most load-bearing
+one. The question is posted in the report's channel, as a reply that **@-mentions the
+ORIGINAL REPORTER** (not a bystander in the thread), in the persona's voice:
+
+> **Sid:** login is broken
+> **Mira:** @Sid a couple of quick things so I can get this filed right:
+> 1. What happens when you try — error, blank screen, redirect loop?
+> 2. Web or mobile, and which screen?
+
+**Don't-pester / watch-for-attachments.** Reporters often post the screenshot or recording a
+moment *after* the text. So before asking, she waits `COS_CLARIFY_ATTACHMENT_WAIT_SECONDS`
+(default 45) and re-reads the thread; if a follow-up attachment or message arrived she
+re-assesses — and if it filled the gap, she never asks. She asks about a given report **at
+most once** and **never re-pings** it.
+
+While it waits, the fully-built plan is **parked** in SQLite (`clarifications`) — parked,
+never executed. It leaves only through the normal ✅/❌ approval gate, one of three ways:
+
+| What happens | Result |
+|---|---|
+| **Someone answers** — a reply to the question (from *anyone*, a teammate may know the repro), or a plain message from the reporter within 30 min of the ask **or the latest bump** | The **whole thread is re-classified with the answer in it** and re-planned, so the ticket carries the repro/owner/scope. Then it's proposed. The answer is recorded against the same report, so it can never become a ticket of its own. |
+| **The answer withdraws it** ("nvm, my mistake", "working now" → re-classifies as noise) | The parked plan is **cancelled**. No ticket. |
+| **Nobody answers** within `COS_CLARIFY_TIMEOUT_MINUTES` (default 120) | The sweeper files the **parked plan flagged needs-triage** (unassigned, for a human to sort) — never dropped, never nagged. If it had already been nudged, the PMs are told once (see below). |
+
+While a clarification is open, the sweeper also nudges the reporter **once** if they go quiet
+(after `COS_CLARIFY_NUDGE_AFTER_MINUTES`, default 60), under the shared nudge policy — this is
+the second nudge source described below.
+
+**Failure is always safe.** Every failure path (model error, unparseable verdict, can't
+post the question, can't park the plan) falls back to *proposing the plan exactly as
+before*. This path can delay and enrich a proposal; it can never file, comment on, or
+transition anything on its own, and it can never lose a report.
+
+## Chief of Staff: proactive follow-up / open threads (`COS_FOLLOWUP_ENABLED`)
+
+People say they'll come back with something and then don't. The bot tracks those.
+
+Any human message in a monitored channel (**no reporter allowlist** — anyone on the team
+can make a promise) passes a cheap keyword prefilter, and only what survives it costs an
+LLM call. The model then decides whether it's a real commitment — *a future deliverable
+the speaker owes the channel*:
+
+| Message | Tracked? |
+|---|---|
+| "I'll confirm the DM dates in an hour" | ✅ — *the DM dates*, due in ~60 min |
+| "will update after testing" | ✅ — *the test results*, no time given → due in `COS_FOLLOWUP_DEFAULT_DUE_MINUTES` |
+| "let me check with Ravi and get back to you" | ✅ — *an answer from Ravi* |
+| "DMs going live tomorrow" · "I'll release/deploy/push it" · "will be done by Friday" | ✅ — go-live / delivery commitments are tracked too |
+| "on it", "looking into it", "wip" | ❌ — work in progress owes the channel nothing |
+| "will do", "sure", "noted", 👍 | ❌ — an acknowledgement is not a deliverable |
+| "can you confirm the DM dates?" | ❌ — that's someone *else's* promise to make |
+
+A tracked **open thread** stores who, what, when they promised, the due time, and a jump
+link to the message (SQLite `open_threads`). It's deliberately conservative — a false
+nudge is worse than a missed one, so anything under `COS_FOLLOWUP_MIN_CONFIDENCE` is
+dropped.
+
+**Two nudge sources, one policy.** Nudge candidates come from **(a)** these tracked
+commitments and **(b)** unanswered clarifying questions (the reporter who's gone quiet).
+Both obey the same guardrail: the same person is nudged about the same item **at most once
+per `COS_NUDGE_WINDOW_HOURS` (default 24)** and **at most `COS_NUDGE_MAX_ATTEMPTS` (default
+2)** times. (These combine with the legacy per-open-thread `COS_FOLLOWUP_*` settings
+conservatively — the effective cooldown is the *longer* and the cap the *smaller* — so
+enabling the policy never makes her more chatty.)
+
+Every `COS_FOLLOWUP_CHECK_INTERVAL_MINUTES` (default 30) a background sweeper surfaces
+aged items **back into the channel they came from**, as a reply to the original message,
+@-mentioning the person:
+
+> **Mira:** <@Ravi> you mentioned the DM dates would be confirmed about an hour ago — any update?
+
+**This is a reminder to a human, and nothing else.** Follow-up **never creates or
+modifies a ticket**: it calls no Linear API, changes no status, and an open thread is
+never an input to ticket creation.
+
+An open thread closes when **anyone replies to the nudge** (or to the original promise),
+or when **anyone ✅'s the nudge** — "handled, stop asking".
+
+**No spam; non-response is recorded and escalated once.** After `COS_NUDGE_MAX_ATTEMPTS`
+with no answer she **stops** — the item is marked **stale** (or, for a clarification, filed
+needs-triage) and the attempt count is kept in the DB, so a forgotten promise never becomes
+a recurring nag. At that point she informs the **PMs (`ESCALATION_USER_IDS`) exactly once**,
+in the escalation channel:
+
+> **Mira:** <@Trishi> <@Kushal> heads up — I've asked <@Ravi> twice about the DM go-live date with no reply, so I'm going to stop chasing it. Nothing's been filed or changed on their behalf.
+
+A `pm_notified` flag on the item guarantees that escalation fires only once. If
+`ESCALATION_USER_IDS` is empty or no escalation channel is configured, she simply stops
+(the non-response is still recorded).
+
+The sweeper services **every** proactive path (aged open threads, clarification nudges,
+timed-out clarifications, and the gap audit below) and is exception-proof by construction: a
+bad row or a Discord blip is logged and the loop continues on the next tick, so follow-up
+can never silently die.
+
+## Chief of Staff: the two-level escalation ladder
+
+Each sweep, the bot reads the team's **active** Linear issues and asks: *what would a Chief
+of Staff chase here, and **who can actually answer it**?*
+
+That second question is the whole design. Asking an engineer to make a prioritisation
+call is useless; asking a PM for a repro is worse. So there are two rungs.
+
+### Scope — active issues only (`COS_ACTIVE_STATE_NAMES`)
+
+She only ever considers issues whose workflow-**state name** is one of
+**In Progress**, **Implemented** (a.k.a. **"awaiting QA"** — dev-done, not yet tested), or
+**In Review** (`list_active_issues_for_audit`, a read-only projection that also pulls each
+issue's **project target date**). **Backlog, Todo, Done, and Canceled are ignored.** The
+match is by NAME (case-insensitive), not type, because these states share the
+`started`/`completed` *type* — only the name distinguishes "actively being worked" from a
+backlog item or a shipped one. Override the set with `COS_ACTIVE_STATE_NAMES` to match your
+workspace's exact state names (the default lists both `Implemented` and `awaiting QA`).
+
+### She reads the comments before she tags (`COS_CHECK_COMMENTS_ENABLED`)
+
+Before pinging anyone about a level-1 gap, she reads the issue's comments
+(`assess_issue_comments`) — the answer is often already there:
+
+- **A comment already resolves it** → she does **not** tag. For a missing due date, that
+  means someone committed to a date ("shipping the 18th"); she takes it and — if the
+  deadline write is on — sets it (see *Close the loop*).
+- **The comments show a blocker** — a stated blocker, an unclear description the assignee
+  flagged, or a need for knowledge-transfer from a colleague → a ping to the IC won't help,
+  so she **escalates the reason to the PMs** instead (a level-2 `blocker` finding) when it
+  needs a decision/prioritisation call, and otherwise stays quiet.
+- **Neither** → she tags the assignee as planned.
+
+Read-only, on by default. A model outage or a low-confidence read just means she tags as
+she would have — the check never silently swallows a nudge.
+
+### Level 1 — tag the **assignee** (`COS_TAG_ASSIGNEE_ENABLED`)
+
+A **data gap on their own issue** — something they can answer in one line:
+
+| Trigger | Detected by |
+|---|---|
+| **No due date on an active launch-critical issue** as its project's target date closes in (`COS_LAUNCH_WINDOW_DAYS`, default 7) | Deterministic — **the flagship trigger.** A plain missing date **always** goes to the assignee, **never** to the PMs. |
+| **Bug with no repro** — nobody could make it happen | Model (`assess_issue_gap`) |
+| **Scope too vague to build** — "fix the dashboard" | Model (`assess_issue_gap`) |
+
+> **Mira:** <@Ravi> NFT2-591 (DMs 1:1 FE) has no due date and DMs launches in 3 days — when will this be ready?
+
+### Level 2 — escalate to the **PMs** (`COS_ESCALATE_ENABLED`, `ESCALATION_USER_IDS`)
+
+**Above an IC** — the assignee is *not* asked, because the answer isn't theirs to give:
+
+| Trigger | Detected by |
+|---|---|
+| **Stuck In Progress** ≥ `STALE_IN_PROGRESS_DAYS` (default 3) with **no state change and no comment explaining why** | Deterministic |
+| **Launch-critical issue with no assignee** — there's no IC to ask; who owns it is a PM call | Deterministic |
+| **Comment-evidenced blocker** — the comments show the work is stuck on a decision, a prioritisation call, or a dependency someone else owns | Model (`assess_issue_comments`) |
+
+> **Mira:** <@Trishi> <@Kushal> NFT2-660 (QA 1:1 DMs) has been In Progress for 5 days with no comments explaining the holdup — DMs launches in 3 days. Needs a call.
+
+A **plain missing due date is never a PM escalation** — it is always a level-1 question to
+the assignee. The PMs are only pulled in for the genuine "big problem" cases above. And the
+old **comment check on staleness** still holds: an issue stuck for a week *with someone
+explaining why* is not escalated — somebody already said what's going on.
+
+### Close the loop — the one scoped Linear write (`COS_UPDATE_DEADLINE_ENABLED`)
+
+This is the **only** thing the CoS writes to Linear, and it is **opt-in (default off)**.
+After she tags an assignee about a missing due date, she starts a **deadline watch** and, on
+later sweeps, looks for the answer from **three** sources (in priority order):
+
+1. the assignee's **Discord reply** to her tag (she parses a date from it),
+2. a **comment** they left on the issue,
+3. the **standup notes** (a date mentioned there for that issue key).
+
+When she finds a concrete date (`extract_deadline` resolves "by Friday" / "the 18th" /
+"next Tuesday" against today), she **sets the issue's due date and adds a comment noting the
+new date and its source**. She may do **only** those two things — **never** a status change
+and **never** a reassignment (the mutation literally can't carry a state or assignee).
+
+**Test it safely with dry-run.** `COS_UPDATE_DEADLINE_DRY_RUN` defaults **true** even once
+the feature is enabled: she logs `would set NFT2-591 due 2026-07-18 (source: Discord reply)`
+and writes nothing. Set it false only when you want real writes. A watch nobody answers
+within `COS_DEADLINE_WATCH_EXPIRE_DAYS` (default 7) is quietly given up on.
+
+### The reverse `DISCORD_LINEAR_MAP` lookup
+
+`DISCORD_LINEAR_MAP` answers *"which Linear user does this Discord reporter map to"*.
+Tagging needs the **opposite**: it starts from a Linear issue's **assignee** and must
+work out who to @-mention in Discord. So `config.py` builds a **reverse index** at
+startup (Linear email/UUID, lower-cased → Discord id) exposed as
+`config.discord_id_for_linear(...)`.
+
+**If a Linear user has no Discord id, they are never pinged** — the bot names them in
+plain text instead (*"Shreyansh NFT2-591 has no due date…"*). That's also the guardrail:
+the reverse map is the *only* way an assignee can be mentioned, so a stray Linear account
+can't be tagged into the channel.
+
+### Guardrails (she is now posting unprompted @-mentions)
+
+- **Rate limit.** The same person is never tagged about the same issue **for the same
+  reason** more than once per `COS_TAG_COOLDOWN_HOURS` (default 24). The key is
+  *(audience, issue, kind)*, so she may later ask the same person about a *different*
+  issue, or the same issue for a *different* reason — but never repeat herself. Pending
+  nudges are also de-duped **within** a sweep, and at most **one finding per issue** is
+  ever raised.
+- **Fails closed.** If the rate-limit check itself errors, she **stays quiet** —
+  double-tagging someone is worse than missing a nudge.
+- **Only reachable, mapped people.** Assignees only via the reverse map (unmapped → plain
+  text, no ping); level-2 escalations **only** to `ESCALATION_USER_IDS`, never anyone else.
+- **Per-sweep cap** (`COS_MAX_NUDGES_PER_SWEEP`, default 3) so a fresh bot meeting a messy
+  backlog can't carpet-bomb the channel. The rest are held over.
+- **Quiet by default.** Off a launching project, an undated backlog issue is normal life —
+  she leaves it alone. A model-judged gap below `COS_CLARIFY_MIN_CONFIDENCE` is dropped
+  rather than interrupt an engineer, and a model outage means silence, never a bad nudge.
+- **She NUDGES ONLY — with one opt-in exception.** Every path here is a Discord message
+  asking a human, and `escalation.py` holds **no Linear client and no Discord client at
+  all**, so the *decision* logic is structurally read-only. The **sole** write is the
+  close-the-loop deadline update (`COS_UPDATE_DEADLINE_ENABLED`, **off by default**, and
+  dry-run by default even when on) — and it is tightly scoped to **set the due date + add a
+  comment**, nothing else. Everything else — tagging, escalation, the comment check —
+  remains strictly read-only.
+
+Nudges are posted to `COS_NUDGE_CHANNEL_ID` (default: the first monitored channel).
 
 ## Query mode (read-only)
 
@@ -594,9 +917,28 @@ startup logs a warning and the bot treats it as query-only (no ticket creation).
 Clean module roles:
 
 - **`classifier.py`** — `Anthropic`-backed text/JSON producer. Prompts: report
-  classifier, query **router** (`parse_query` → `is_query` + `source`), and the
-  `person_activity` synthesiser (`summarize_person_activity`). **Never** touches
-  Linear or Discord.
+  classifier, query **router** (`parse_query` → `is_query` + `source`), the
+  `person_activity` synthesiser (`summarize_person_activity`), the clarification gap
+  check (`assess_clarification` → *is anything essential missing, and what's the one
+  question?*), commitment extraction (`detect_commitment` → *what is owed, by when?*),
+  and the follow-up nudge (`followup_nudge`). **Never** touches Linear or Discord.
+- **`persona.py`** — the Chief-of-Staff identity (`COS_NAME`) and every prompt she
+  *speaks* through. Governs **voice only** — never what the bot does or is allowed to
+  do. `COS_PERSONA_ENABLED=false` reverts each prompt to its original neutral voice.
+- **`clarify.py`** — the clarifying-question **gate** (only a *create* plan is ever
+  paused; a comment on an existing issue carries its own context and shouldn't be
+  delayed) plus the deterministic fallback question. Holds no state and calls nothing.
+- **`followups.py`** — open-threads support: the cheap commitment **prefilter** (so
+  most chatter never reaches the LLM), due-time math (clamped so a bad estimate can't
+  schedule a nudge 90 seconds or 3 months out), and the deterministic fallback nudge.
+  **Read/propose only by construction** — it has no Linear client and no Discord client.
+- **`escalation.py`** — the ladder's **decision logic**: given already-fetched issue
+  dicts, which gaps are worth chasing (`find_gaps`) and which **level** each belongs to
+  (incl. `is_active` for the state-NAME scope and `pm_blocker_finding` for a
+  comment-evidenced blocker). Pure — **no clients, no I/O**, which is both why it's
+  directly testable and why the *decision* structurally cannot write to Linear. `bot.py`
+  resolves the audience, reads comments, posts, and (opt-in) applies the deadline write;
+  `classifier.py` writes the words and judges the comments/deadlines.
 - **`query_engine.py`** — the tool-driven query engine: `Anthropic` tool-use loop
   over a set of read-only Linear tools (`search_issues`, `get_issue`,
   `get_issue_history`, `list_issues`, `resolve_member`, `list_team_members`), plus
@@ -604,11 +946,14 @@ Clean module roles:
   5 iterations; read-only by construction.
 - **`linear_client.py`** — all Linear reads/writes over GraphQL. No Linear MCP.
   Write/report helpers: `resolve_label_ids`, `resolve_assignee`, `create_issue`,
-  `add_comment`, `set_issue_status`, `list_team_states`. Query-mode reads:
-  `search_issues` / `find_issues_by_text` (full-text lookup), `get_issue` (full
-  fields), `get_issue_history` (change timeline), `list_issues` /
-  `list_issues_query` (flexible filter + sort), `resolve_member_id`,
-  `list_team_members`, `active_issues_for_user`.
+  `add_comment`, `set_issue_status`, `set_issue_due_date` (the scoped close-the-loop
+  write — due date only), `list_team_states`. Audit reads:
+  `list_active_issues_for_audit` (active issues by state NAME, with comments + project
+  target date). Query-mode reads: `search_issues` / `find_issues_by_text` (full-text
+  lookup), `get_issue` (full fields), `get_issue_history` (change timeline),
+  `list_comments`, `list_issues` / `list_issues_query` (flexible filter + sort),
+  `resolve_member_id`, `list_team_members`, `active_issues_for_user`, and the project
+  tools (`list_projects`, `get_project`, `get_project_issues`, `list_milestones`).
 - **`query.py`** — read-only building blocks for the Discord-scoped path:
   `scan_recent_messages` (Discord history scan over monitored channels) and
   `resolve_person` (free-text name → Linear user + Discord user). Takes the
@@ -682,6 +1027,53 @@ See `.env.example` for the full list with comments. Key knobs:
 | `STANDUP_SYNC_CMD`        | _(empty)_              | Optional shell sync command run before reading a "today/this morning" standup query. |
 | `ARCHIVE_FILE`            | _(empty)_              | Frozen markdown snapshot of Done issues; read-only fallback when live Linear can't find an issue. |
 | `HOLIDAY_CHANNEL_ID`      | _(empty)_              | Discord channel of OOO/leave posts, read for delay context. NOT triaged. |
+| `COS_PERSONA_ENABLED`     | `true`                 | Speak as the named Chief-of-Staff persona (voice only — see `persona.py`). `false` reverts to the neutral voice. |
+| `COS_NAME`                | `Mira`                 | The name the bot uses everywhere it speaks or tags people. |
+| `QUERY_MEMORY_TURNS`      | `5`                    | Recent (question, answer) turns kept per channel so a follow-up ("what about Ravi?") inherits its intent. |
+| `QUERY_MEMORY_TTL_MINUTES`| `10`                   | How long those short-term query turns live before expiring. In-memory only. |
+
+### Chief of Staff: clarifying questions & follow-up
+
+| Variable                                 | Default | Purpose                                                                 |
+|------------------------------------------|---------|-------------------------------------------------------------------------|
+| `COS_CLARIFY_ENABLED`                    | `true`  | Ask when a report is missing something essential, instead of proposing a half-complete ticket. The plan is parked, never filed. `false` → straight to the approval embed, as before. |
+| `COS_CLARIFY_MAX_QUESTIONS`              | `3`     | Max questions **bundled into ONE message** (a short numbered list). `1` keeps strict single-question behaviour; it never fires multiple messages. |
+| `COS_CLARIFY_ATTACHMENT_WAIT_SECONDS`    | `45`    | Before asking, wait this long and re-read the thread — if the reporter's screenshot/recording or a follow-up landed, re-assess (and maybe don't ask). `0` disables the wait. |
+| `COS_CLARIFY_TIMEOUT_MINUTES`            | `120`   | How long to wait for an answer before filing the **parked plan flagged needs-triage**. Never dropped, never re-pinged. |
+| `COS_CLARIFY_NUDGE_AFTER_MINUTES`        | `60`    | How long an unanswered question sits before the sweeper nudges the reporter **once** (under the unified nudge policy). Kept under the timeout. |
+| `COS_CLARIFY_MIN_CONFIDENCE`             | `0.6`   | Only pause a report on a gap the model is at least this sure about. Below it → propose immediately. Also gates the model-judged escalation gaps. |
+| `COS_FOLLOWUP_ENABLED`                   | `true`  | Track commitments — incl. go-live/delivery ("DMs going live tomorrow", "I'll release it", "will be done by Friday") — and nudge the person when one ages past due. **Never creates or modifies a ticket** — nudge only. |
+| `COS_FOLLOWUP_CHECK_INTERVAL_MINUTES`    | `30`    | How often the sweeper looks for aged open threads, clarification nudges, and timed-out clarifications. |
+| `COS_FOLLOWUP_DEFAULT_DUE_MINUTES`       | `180`   | Due time for a promise with **no** stated deadline ("will update after testing"). A stated time always wins. |
+| `COS_FOLLOWUP_MIN_CONFIDENCE`            | `0.6`   | Only track a commitment the model is at least this sure about — a false nudge is worse than a missed one. |
+| `COS_FOLLOWUP_MAX_REMINDERS`             | `2`     | Legacy per-open-thread cap. Combined conservatively with `COS_NUDGE_MAX_ATTEMPTS` (the **smaller** wins). |
+| `COS_FOLLOWUP_REMINDER_COOLDOWN_MINUTES` | `180`   | Legacy per-open-thread cooldown. Combined conservatively with `COS_NUDGE_WINDOW_HOURS` (the **longer** wins). |
+| `COS_NUDGE_WINDOW_HOURS`                 | `24`    | **Unified nudge policy:** nudge the same person about the same item at most once per this window — applies to BOTH commitments and unanswered clarifications. |
+| `COS_NUDGE_MAX_ATTEMPTS`                 | `2`     | **Unified nudge policy:** max nudges per item before she stops, records the non-response, and informs the PMs (`ESCALATION_USER_IDS`) **once**. |
+
+### Chief of Staff: the escalation ladder
+
+| Variable                    | Default   | Purpose                                                                 |
+|-----------------------------|-----------|-------------------------------------------------------------------------|
+| `COS_TAG_ASSIGNEE_ENABLED`  | `true`    | **Level 1** — @-mention the **assignee** for a data gap on their own issue (no due date on an active launching issue, no repro, vague scope). A plain missing date **only** ever goes here, never to the PMs. |
+| `COS_ESCALATE_ENABLED`      | `true`    | **Level 2** — @-mention the **PMs** for a call above an IC (stuck-and-silent, an unowned launch issue, or a comment-evidenced blocker needing a decision). |
+| `ESCALATION_USER_IDS`       | _(empty)_ | Discord IDs of the PMs (Trishi, Kushal) — the **only** people a level-2 escalation may tag. Empty → escalations are skipped, with a startup warning. |
+| `COS_ACTIVE_STATE_NAMES`    | `In Progress,Implemented,awaiting QA,In Review` | **Scope (point 1):** only issues whose state **NAME** is in this list are considered. Backlog/Todo/Done/Canceled ignored. Matched by name (case-insensitive), since these states share the `started`/`completed` *type*. Override to your workspace's state names. |
+| `COS_CHECK_COMMENTS_ENABLED`| `true`    | **Point 2 (read-only):** read an issue's comments before tagging. A comment already answering the gap → don't tag; a blocker needing a decision → escalate to the PMs instead of the IC. |
+| `COS_UPDATE_DEADLINE_ENABLED` | `false` | **Point 3 — the ONE scoped Linear write, opt-in.** After tagging about a missing date, watch for the answer (Discord reply / issue comment / standup) and **set the due date + add a comment**. Never changes status or assignee. |
+| `COS_UPDATE_DEADLINE_DRY_RUN` | `true`  | Safety valve for the write above: when true (default, even when the feature is on) she **logs** the intended update and writes nothing. Set false to arm real writes. |
+| `COS_DEADLINE_WATCH_EXPIRE_DAYS` | `7`  | How long a deadline watch waits for an answer before it's given up on (expired). |
+| `STALE_IN_PROGRESS_DAYS`    | `3`       | Days In Progress with **no state change and no explaining comment** before it's a PM call. |
+| `COS_LAUNCH_WINDOW_DAYS`    | `7`       | A project target date this close (or past) makes its issues launch-critical — the DMs trigger. Outside it, an undated issue is left alone. |
+| `COS_TAG_COOLDOWN_HOURS`    | `24`      | **Rate limit:** never tag the same person about the same issue for the same reason twice inside this window. Fails **closed**. |
+| `COS_MAX_NUDGES_PER_SWEEP`  | `3`       | Cap on nudges posted per sweep, so a messy backlog can't carpet-bomb the channel. The rest are held over. |
+| `COS_NUDGE_CHANNEL_ID`      | _(empty)_ | Where nudges/escalations are posted. Empty → the first monitored channel. |
+| `COS_AUDIT_MAX_ISSUES`      | `50`      | Cap on issues pulled per audit pass, bounding Linear + LLM cost. |
+
+Who can be @-mentioned is governed by **`DISCORD_LINEAR_MAP` read in reverse** (see
+above): an assignee with no entry there is **never pinged**, only named in plain text.
+`COS_CLARIFY_MIN_CONFIDENCE` also gates the model-judged gaps (missing repro / vague
+scope), the comment check, and the deadline-extraction confidence.
 
 ## Operational notes
 
@@ -694,6 +1086,29 @@ See `.env.example` for the full list with comments. Key knobs:
 - Auto-execute failures (`REQUIRE_APPROVAL=false`) post a `⚠️ Auto-execute
   failed` notice to the approval channel and mark the row rejected, so the
   message isn't retried on its own — investigate and re-trigger manually.
+- **New tables** (`clarifications`, `open_threads`, `nudges`, `deadline_watch`) are created
+  automatically on startup, and **new columns on existing tables are added in place** via a
+  lightweight idempotent migration (`open_threads.pm_notified`; `clarifications.nudges_sent`
+  / `last_nudged_at` / `pm_notified`) — an existing `bot_state.db` is upgraded on the next
+  start, nothing to run by hand. The `nudges` table **is** the escalation rate limit:
+  deleting it makes the bot willing to re-tag everyone about everything, so keep it with the
+  rest of the DB. The `pm_notified` flags guarantee a give-up is escalated to the PMs only
+  once; `deadline_watch` tracks the close-the-loop asks the bot is waiting on an answer for.
+- **Turning the ladder on for the first time on an existing backlog** is the one moment
+  it can be noisy. `COS_MAX_NUDGES_PER_SWEEP` (default 3) bounds this, but consider
+  starting with `COS_ESCALATE_ENABLED=false` and a short `COS_LAUNCH_WINDOW_DAYS` to see
+  what it *would* chase (the audit logs every finding at INFO, including the ones it
+  suppresses) before letting it tag the PMs.
+- **Parked plans and open threads survive restarts** — both live in SQLite, and the
+  sweeper picks them up on the next tick. A clarification asked just before a restart
+  is still answerable, and still times out correctly.
+- The sweeper starts in `setup_hook` and runs while **either** CoS flag is on. With
+  both `COS_CLARIFY_ENABLED=false` and `COS_FOLLOWUP_ENABLED=false` it isn't started
+  at all, and the bot behaves exactly as it did before these features.
+- **Cost:** clarification adds ~1 small LLM call per *proposed create* (not per
+  message). Commitment detection runs only on messages that pass a keyword prefilter,
+  so ordinary chatter costs nothing. The sweeper itself makes an LLM call only when it
+  actually has a nudge to send.
 
 ## What's deliberately not in scope
 

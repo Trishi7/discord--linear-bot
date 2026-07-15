@@ -25,6 +25,7 @@ from typing import Optional
 from anthropic import Anthropic
 
 from conventions import TEAM_CONVENTIONS
+from persona import cos_preamble
 
 log = logging.getLogger(__name__)
 
@@ -181,6 +182,98 @@ LINEAR_TOOLS = [
         "description": "List all Linear team members as {id, name, displayName, email}. Use to look up who exists.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "name": "list_projects",
+        "description": (
+            "List the team's Linear PROJECTS as [{name, target_date, lead, status, "
+            "priority, progress_pct, summary, milestone_count, url}]. A project is a "
+            "feature/launch (e.g. 'DMs & Group Chat (v1)', 'Onboarding') — bigger than an "
+            "issue. Use this to see what projects exist, or to resolve a spoken feature "
+            "name to a real project before answering. 'status' is the project's own state "
+            "(e.g. Backlog / In Progress / Implemented); 'target_date' is the "
+            "launch/release date when the project has no milestones."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_project",
+        "description": (
+            "Full detail for ONE project, resolved from a name or the team's shorthand "
+            "('DMs', 'messaging', 'onboarding', 'pulse'). Returns the project meta "
+            "(name, summary, description, url, start_date, target_date, lead, status, "
+            "priority, progress_pct, health), its MILESTONES (each with target_date and "
+            "issue_total / issue_completed), and issue_totals (total plus counts "
+            "by_state_name and by_state_type). LEAD project-level answers with this: the "
+            "release date is the LAUNCH milestone's target_date, or the project "
+            "target_date when there are no milestones. If it returns {error, candidates}, "
+            "the name didn't resolve to one project — pick from candidates or fall back to "
+            "search_issues."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Project name or shorthand, e.g. 'DMs', 'onboarding'.",
+                }
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "get_project_issues",
+        "description": (
+            "List the issues IN a project (resolved from a name/shorthand), each with "
+            "identifier, title, state, labels, assignee, milestone, dueDate, updatedAt, "
+            "priority, url. Use this for the drill-down AFTER a project-level summary, and "
+            "for 'any FE/BE work left for X' — pass labels=['FE'] (or ['BE']) and "
+            "state_types to filter server-side. Returns {project, target_date, issues[]} "
+            "or {error, candidates} if the name doesn't resolve to one project."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Project name or shorthand, e.g. 'DMs'.",
+                },
+                "labels": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Label names to filter by, e.g. ['FE'] or ['BE','Bug'].",
+                },
+                "state_types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["backlog", "unstarted", "started", "completed", "canceled", "triage"],
+                    },
+                    "description": "Workflow state types to keep. Omit for all.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "list_milestones",
+        "description": (
+            "List a project's MILESTONES (resolved from a name/shorthand), each with "
+            "target_date and completion (issue_total / issue_completed). Returns "
+            "{project, target_date, milestones[]}; milestones is [] with a note when the "
+            "project has none (common — then use the project target_date as the "
+            "launch/release date). {error, candidates} if the name doesn't resolve."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Project name or shorthand, e.g. 'DMs'.",
+                }
+            },
+            "required": ["name"],
+        },
+    },
 ]
 
 
@@ -192,7 +285,7 @@ def _system_prompt(*, requester_name: str, requester_linear_id: Optional[str], t
         '. When they say "me", "my", "mine", or "I", they mean themselves — use that '
         "identity/id directly instead of resolving a name."
     )
-    return TEAM_CONVENTIONS + "\n\n" + f"""You answer questions about the NFThing /
+    return cos_preamble() + TEAM_CONVENTIONS + "\n\n" + f"""You answer questions about the NFThing /
 NFThing2.0 team's Linear issues, posted in Discord, following the TEAM CONVENTIONS
 above. NFThing2.0 is the team's product; issues use keys like NFT2-123. Today's
 date is {today} (UTC).
@@ -213,6 +306,11 @@ or move anything — only read. Answer by CALLING TOOLS, never by guessing:
 - For group questions ("what's due this week", "assigned to Ravi", "open bugs"),
   use list_issues. Resolve any person name to an id with resolve_member first,
   then pass assignee_id. Compute date ranges from today's date above.
+- If the question names a FEATURE / LAUNCH / area rather than one issue ("DMs",
+  "direct messaging", "the DMs feature", "onboarding", "pulse", "wallet") — ESPECIALLY
+  "when does X go live / ship", "status of X", "is X on track", "any FE/BE work for X" —
+  treat X as a possible PROJECT first: see PROJECT-LEVEL QUESTIONS below. Only fall
+  back to search_issues (keyword issue search) if X doesn't resolve to a project.
 - For "sorted by priority / due date", pass the matching 'order' to list_issues.
 - Dates & comments are first-class. For a single issue's status / timeline / "why
   delayed", see the ISSUE-THREAD QUESTIONS section below (read the comments and
@@ -220,6 +318,42 @@ or move anything — only read. Answer by CALLING TOOLS, never by guessing:
   "due this week" / "created before X" — use list_issues' dueDate / created_before /
   created_after bounds. NEVER invent a date, comment, or event that isn't in the
   tool data.
+
+PROJECT-LEVEL QUESTIONS — when the subject is a PROJECT (a feature/launch), answer at
+the project level FIRST, then drill into issues. A project is bigger than an issue:
+"DMs & Group Chat (v1)", "Onboarding", "Pulse — V2". Colloquial names resolve via the
+tools' alias/fuzzy matching, so pass the user's own word ("DMs", "messaging").
+- RESOLVE FIRST: call get_project(name) (or list_projects to see what exists / when a
+  name is ambiguous). If it returns {error, candidates}, tell the user briefly which
+  projects it could be, or pick the obvious one — don't silently fall back to a flat
+  issue search when a project clearly matches.
+- "when does X go live / ship / what's the release date": report the LAUNCH milestone's
+  target_date if the project has milestones; OTHERWISE (most projects here have none)
+  the project's own target_date IS the launch date. State it plainly with the weekday,
+  e.g. "DMs v1 is targeted to go live Thursday 16 Jul." Then, if asked or relevant,
+  separate LAUNCH-BLOCKING work from post-launch: an issue whose dueDate is on/before
+  the target date (or whose scope the description marks as v1) is launch-blocking; work
+  clearly scoped as later/post-launch being incomplete does NOT move the launch date —
+  say so.
+- "what's the status of X": use get_project's issue_totals + milestones to roll up BY
+  MILESTONE (when present) and BY STATE, and LEAD WITH THE LAUNCH PICTURE, e.g. "13 of
+  17 issues are dev-complete/awaiting QA, 2 in QA (In Review), 2 still In Progress;
+  target Thu 16 Jul." Remember this team types "awaiting QA" and "Done" as 'completed'
+  and "In Progress"/"In Review" as 'started' — an awaiting-QA issue is dev-done, not
+  abandoned; report the literal state names.
+- "is X on track / will it make the date": compare the INCOMPLETE launch issues (state
+  not 'completed'/'canceled', dueDate on/before target) against the target_date and the
+  days remaining from today; if a few urgent/high issues are still 'started' with the
+  date imminent, flag the risk plainly. Don't over-claim — say what the counts show.
+- "any FE/BE work (left) for X": call get_project_issues(name, labels=['FE'] or ['BE'],
+  state_types=['backlog','unstarted','started'] for "left/remaining"). List what comes
+  back in the one-line-per-issue shape.
+- DRILL DOWN AFTER the project-level summary: use get_project_issues to list the child
+  issues grouped by milestone (when present) or by state — the same compact
+  one-line-per-issue OUTPUT FORMAT below. Lead with the summary; the list is the detail.
+- NEVER invent a target date, milestone, or count — use only what the project tools
+  return. If target_date is null, say the project has no target date set rather than
+  guessing one.
 
 Person status — "what is X working on / up to". GATHER from ALL sources, then lay
 the answer out in the FIXED SECTIONS below — the three evidence sections in order,
@@ -408,6 +542,7 @@ class QueryEngine:
         requester_name: str = "",
         requester_linear_id: Optional[str] = None,
         extra_tools: Optional[list[dict]] = None,
+        history: Optional[list[dict]] = None,
     ) -> Optional[str]:
         """Answer `question` by looping model ⇄ tools. Returns the final reply
         text, or None on total failure (the caller can fall back to a nudge).
@@ -416,7 +551,13 @@ class QueryEngine:
         built-in Linear set — each is {"schema": <tool def>, "handler": async
         fn(input_dict) -> jsonable}. bot.py uses this to inject the Discord↔Linear
         linking tools (which need the DB + Discord client) without coupling the
-        engine to Discord."""
+        engine to Discord.
+
+        `history` is the last few prior turns in this channel/thread as
+        [{"question", "answer"}] (oldest first). They're replayed as user/
+        assistant messages BEFORE the current question so a follow-up that omits
+        the subject ("what about Ravi?") resolves against what was just asked.
+        Short-term working context only — never persisted, never a ticket input."""
         extra_tools = extra_tools or []
         extra_handlers = {
             t["schema"]["name"]: t["handler"] for t in extra_tools
@@ -428,10 +569,20 @@ class QueryEngine:
             requester_linear_id=requester_linear_id,
             today=today,
         )
-        messages: list[dict] = [{"role": "user", "content": question}]
+        # Replay recent turns first so the model can resolve a follow-up that
+        # leans on them; the current question always comes last.
+        messages: list[dict] = []
+        for turn in history or []:
+            q = str((turn or {}).get("question") or "").strip()
+            a = str((turn or {}).get("answer") or "").strip()
+            if q and a:
+                messages.append({"role": "user", "content": q})
+                messages.append({"role": "assistant", "content": a})
+        messages.append({"role": "user", "content": question})
         log.info(
-            "[engine] start question=%r requester=%r linear_id=%s",
+            "[engine] start question=%r requester=%r linear_id=%s history_turns=%d",
             question[:160], requester_name, requester_linear_id,
+            len([t for t in (history or []) if (t or {}).get("question")]),
         )
 
         last_text = ""
@@ -579,6 +730,31 @@ class QueryEngine:
 
             if name == "list_team_members":
                 return await self._linear.list_team_members()
+
+            if name == "list_projects":
+                return await self._linear.list_projects()
+
+            if name == "get_project":
+                pname = str(tool_input.get("name") or "").strip()
+                if not pname:
+                    return {"error": "get_project requires 'name'"}
+                return await self._linear.get_project(pname)
+
+            if name == "get_project_issues":
+                pname = str(tool_input.get("name") or "").strip()
+                if not pname:
+                    return {"error": "get_project_issues requires 'name'"}
+                return await self._linear.get_project_issues(
+                    pname,
+                    label_names=tool_input.get("labels") or None,
+                    state_types=tool_input.get("state_types") or None,
+                )
+
+            if name == "list_milestones":
+                pname = str(tool_input.get("name") or "").strip()
+                if not pname:
+                    return {"error": "list_milestones requires 'name'"}
+                return await self._linear.list_milestones(pname)
 
             return {"error": f"unknown tool '{name}'"}
         except Exception as e:

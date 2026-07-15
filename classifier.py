@@ -20,11 +20,25 @@ import asyncio
 import json
 import logging
 import re
+from datetime import date as _date
 from typing import Optional
 
 from anthropic import Anthropic
 
+import escalation
 from conventions import TEAM_CONVENTIONS
+from followups import fallback_nudge
+from persona import (
+    CLARIFY_PROMPT,
+    COMMENT_ASSESS_PROMPT,
+    DEADLINE_EXTRACT_PROMPT,
+    ESCALATION_PROMPT,
+    FOLLOWUP_NUDGE_PROMPT,
+    ISSUE_GAP_PROMPT,
+    SOCIAL_REPLY_PROMPT,
+    cos_preamble,
+    fallback_social_reply,
+)
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +118,9 @@ QUERY_SYSTEM_PROMPT = """You parse Discord questions for the NFThing / membrane
 engineering team into structured filters. You ONLY parse — you never fetch,
 create, or modify anything.
 
+You ALSO tag what KIND of message it is (`message_kind`) so the caller can route
+greetings and small talk to a human reply instead of bouncing them with help text.
+
 There are FOUR kinds of question:
 - person_activity: "what is <person> working on / up to / handling these days",
   "what's <person> been doing" — a status check on ONE teammate. This blends the
@@ -127,6 +144,7 @@ There are FOUR kinds of question:
 Output STRICT JSON only (no preamble, no fences) with this schema:
 {
   "is_query":     true | false,
+  "message_kind": "greeting" | "question" | "report" | "unclear",
   "intent":       "person_activity" | "issue_status" | "issue_list" | "standup" | "none",
   "source":       "discord" | "linear" | "both",  // which system to look at; "both" if unscoped
   "person":       string,            // person_activity: the teammate's name; "" otherwise
@@ -141,13 +159,33 @@ Output STRICT JSON only (no preamble, no fences) with this schema:
 }
 
 Rules:
+- message_kind — what SHAPE the message is, judged independently of whether you can
+  map it onto one of the four intents:
+    "greeting"  — a social opener or closer with nothing to look up: "hi", "hey
+                  @bot", "gm", "good morning", "how are you", "thanks", "nice one",
+                  "you're a legend". Small talk. NOT a question about the team.
+    "question"  — the asker WANTS something looked up: any question about people,
+                  issues, standups, leave, or the team's work — INCLUDING one whose
+                  phrasing you don't recognise, one you can't map to an intent, and
+                  one with no question mark ("sid's tickets", "anything blocking the
+                  payout work"). Tag it "question" whenever the asker plausibly wants
+                  an answer — the downstream engine holds every read tool and will
+                  say honestly when it finds nothing. When torn between "question"
+                  and "unclear", ALWAYS pick "question".
+    "report"    — a NEW bug/feature/improvement being FILED, not a question about
+                  one ("the upload button is broken", "we should add dark mode").
+    "unclear"   — genuinely can't tell what is wanted, and it isn't a greeting or a
+                  report. This is a LAST resort — use it rarely.
 - is_query=true whenever the message is a QUESTION the bot could answer from Linear
   or the standup notes — i.e. ANY person_activity, issue_status, issue_list, OR
   standup question. Set is_query=false (intent="none") ONLY for things that are not
   answerable questions at all: greetings/thanks/chit-chat, a NEW bug/feature report
   being filed, or off-topic messages. When unsure whether a question is answerable,
   prefer is_query=true and let the downstream tools decide — do NOT gate a real
-  question out.
+  question out. is_query and message_kind are INDEPENDENT: an oddly-phrased question
+  you can't map to an intent is still message_kind="question" (with is_query=false,
+  intent="none") — the caller routes it to the engine on that basis, so never call a
+  real question a greeting to force it out.
 - intent="person_activity" when the question asks what a specific PERSON is working
   on / up to / handling / has been doing / mentioned / said. Set `person` to that
   name (preserve casing); leave issue-filter fields (identifier/search_term/
@@ -199,6 +237,14 @@ Rules:
   "Harsh", labels=["Bug"] so the answer narrows to bug reports.
 - search_term: any free-text keywords from the question not covered by other
   fields. "" if not applicable.
+- FOLLOW-UPS: if "Recent conversation" turns are supplied above the question, use
+  them ONLY to resolve a message that is elliptical on its own — one that carries
+  over the previous intent while swapping the subject. E.g. after "what is Arun
+  working on?", a bare "what about Ravi?" / "and Ravi?" / "him?" inherits
+  intent="person_activity" with person="Ravi" (keep the previous source). Likewise
+  a bare follow-up after an issue_status/issue_list question inherits that intent.
+  Only borrow the INTENT/scope, never invented specifics. If the new message stands
+  on its own as a full question, ignore the history and parse it directly.
 - Don't invent details. Default fields rather than guess.
 """
 
@@ -253,6 +299,56 @@ Hard rules:
 """
 
 
+COMMITMENT_PROMPT = """You read one Discord message from an engineering team's channel
+and decide ONE thing: did this person just commit to coming back with something?
+
+A COMMITMENT is a promise of a FUTURE deliverable from the speaker — information,
+an answer, a check, a result, or a SHIP/RELEASE/DEPLOY — that someone is now implicitly
+waiting on:
+  "I'll confirm the DM dates in an hour"        → yes: the DM dates, in ~60 min
+  "will update after testing"                    → yes: the test result, no time given
+  "let me check with Ravi and get back to you"   → yes: an answer from Ravi, no time given
+  "I'll push the fix by EOD"                     → yes: the fix, by end of day
+  "give me 30 mins, I'll have the numbers"       → yes: the numbers, in ~30 min
+  "DMs going live tomorrow"                       → yes: the DMs go-live, tomorrow
+  "I'll release it this afternoon"                → yes: the release, ~today
+  "I'll deploy once QA signs off"                 → yes: the deploy, no fixed time
+  "will be done by Friday"                        → yes: it being done, by Friday
+
+NOT a commitment:
+- Work in progress with nothing owed back: "on it", "looking into it", "wip".
+  Someone doing their job is not someone who owes the channel an update.
+- Something already delivered or done: "fixed", "deployed", "shared above", "done".
+- An ask OF someone else: "can you confirm the DM dates?" — that's their promise to
+  make, not the speaker's.
+- Hypotheticals, plans, and intentions with no deliverable: "we should test this",
+  "I might look at it tomorrow", "this will need a migration".
+- Pleasantries: "will do", "sure", "ok", "noted", "👍" — an acknowledgement is not
+  a deliverable. If you cannot name WHAT is owed, it is not a commitment.
+
+"what": the thing being awaited, as a short noun phrase that can be quoted straight
+back to them in a reminder — "the DM dates", "the results of the payment test",
+"an answer from Ravi on the refund flow". NOT a restatement of their sentence, and
+never in the first person. Empty string if there's nothing concrete being awaited.
+
+"due_minutes": how long they gave THEMSELVES, in minutes, from now:
+- "in an hour" → 60; "in 30 mins" → 30; "by EOD"/"today" → 480; "tonight" → 600;
+  "by tomorrow"/"tomorrow" → 1440; "this week"/"by EOW" → 4320.
+- null when they named NO time at all ("will update after testing"). Do not guess.
+
+Be conservative: when in doubt, is_commitment=false. A missed promise is cheaper
+than nagging someone about a promise they never made.
+
+Output STRICT JSON only (no preamble, no markdown fences):
+{
+  "is_commitment": true | false,
+  "what":          "short noun phrase of what is owed — \\"\\" if none",
+  "due_minutes":   integer | null,
+  "confidence":    0.0-1.0
+}
+"""
+
+
 USER_TEMPLATE = """Channel: #{channel}
 Reporter: {author}
 Participants: {participants}
@@ -264,6 +360,19 @@ Conversation (chronological; latest messages may clarify or contradict earlier o
 
 
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+# ISO calendar-date matchers for the deadline path: whole-string, and anywhere-in-text.
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATE_ANYWHERE_RE = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
+
+
+def _valid_iso(s: str) -> bool:
+    """True when `s` is a real YYYY-MM-DD calendar date (rejects 2026-13-40)."""
+    try:
+        _date.fromisoformat(str(s))
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -435,20 +544,48 @@ class Classifier:
         *,
         text: str,
         requester: Optional[str] = None,
+        history: Optional[list[dict]] = None,
     ) -> Optional[dict]:
         """Parse a Discord question into a structured Linear query filter.
 
         Returns a normalised dict (see QUERY_SYSTEM_PROMPT for the schema) or
         None on any failure. Pure parser — never touches Linear.
+
+        `history` is the last few prior turns in this channel as
+        [{"question", "answer"}] (oldest first). It's shown to the parser ONLY so
+        an elliptical follow-up ("what about Ravi?") can inherit the previous
+        intent/scope; the parser never speaks to the user, so no persona here.
         """
         log.info(
-            "[parse_query] step 1/3: prompting model=%s requester=%r text=%r",
+            "[parse_query] step 1/3: prompting model=%s requester=%r history=%d text=%r",
             self._model,
             requester,
+            len(history or []),
             text[:160],
         )
+        history_block = ""
+        turns = [t for t in (history or []) if (t or {}).get("question")]
+        if turns:
+            lines: list[str] = []
+            # Only the most recent few turns matter for resolving a follow-up.
+            for t in turns[-4:]:
+                q = str(t.get("question") or "").strip()
+                a = str(t.get("answer") or "").strip()
+                if q:
+                    lines.append(f"- Q: {q}")
+                if a:
+                    # One short line of the answer is enough to carry the subject.
+                    first = a.splitlines()[0].strip()
+                    lines.append(f"  A: {first[:200]}")
+            history_block = (
+                "Recent conversation in this channel (oldest first) — use ONLY to "
+                "resolve an elliptical follow-up per the FOLLOW-UPS rule:\n"
+                + "\n".join(lines)
+                + "\n\n"
+            )
         user_prompt = (
-            f"Requester display name: {requester or '(unknown)'}\n\n"
+            history_block
+            + f"Requester display name: {requester or '(unknown)'}\n\n"
             f"Question:\n\"\"\"\n{text}\n\"\"\""
         )
         try:
@@ -485,6 +622,27 @@ class Classifier:
         intent = parsed.get("intent", "none")
         if intent not in {"person_activity", "issue_status", "issue_list", "standup", "none"}:
             intent = "none"
+
+        # message_kind drives ROUTING (greeting → warm reply, question → engine).
+        # An unknown/missing value defaults to "question", never "unclear": the
+        # engine answers honestly when nothing applies, so guessing "question" only
+        # costs a lookup, while guessing "unclear" bounces a real asker with help
+        # text — the exact failure this field exists to prevent.
+        message_kind = str(parsed.get("message_kind") or "").strip().lower()
+        if message_kind not in {"greeting", "question", "report", "unclear"}:
+            log.debug(
+                "[parse_query] message_kind %r invalid; defaulting to question",
+                parsed.get("message_kind"),
+            )
+            message_kind = "question"
+        # A parse that DID recognise an answerable question is a question, whatever
+        # the model tagged — the two fields can't disagree in that direction.
+        if is_query and message_kind != "question":
+            log.debug(
+                "[parse_query] is_query=True overrides message_kind=%r → question",
+                message_kind,
+            )
+            message_kind = "question"
 
         source = str(parsed.get("source") or "both").strip().lower()
         if source not in {"discord", "linear", "both"}:
@@ -526,6 +684,7 @@ class Classifier:
 
         normalised = {
             "is_query": is_query,
+            "message_kind": message_kind,
             "intent": intent,
             "source": source,
             "person": person,
@@ -540,6 +699,586 @@ class Classifier:
         }
         log.info("[parse_query] DONE: %s", normalised)
         return normalised
+
+    async def social_reply(
+        self,
+        *,
+        kind: str,
+        text: str = "",
+        requester: Optional[str] = None,
+    ) -> str:
+        """The bot's voice on the NON-answer paths: a greeting/small-talk reply
+        ("greeting") or the last-resort "I couldn't make progress on that" nudge
+        ("unclear"). Written by the model in the Chief-of-Staff persona so these
+        paths sound like the same colleague as the answer path, never a fixed
+        "here are my commands" template.
+
+        Always returns something sendable: on any API/parse failure it falls back
+        to `persona.fallback_social_reply`, which is still first-person and warm.
+        Read-only — this path never touches Linear, the DB, or Discord history.
+        """
+        kind = (kind or "unclear").strip().lower()
+        if kind not in {"greeting", "unclear"}:
+            kind = "unclear"
+        log.info(
+            "[social_reply] kind=%s requester=%r text=%r", kind, requester, text[:120]
+        )
+
+        user_prompt = (
+            f"Message kind: {kind}\n"
+            f"Who is speaking to you: {requester or '(unknown)'}\n\n"
+            f"Their message:\n\"\"\"\n{text}\n\"\"\"\n\n"
+            "Reply to them now, in your own voice, per the rules above."
+        )
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=200,
+                # Reply path → speak as the Chief-of-Staff persona (voice only).
+                system=cos_preamble() + SOCIAL_REPLY_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except Exception:
+            log.exception("[social_reply] Anthropic call raised; using persona fallback")
+            return fallback_social_reply(kind, requester or "")
+
+        text_blocks = [
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ]
+        reply = _JSON_FENCE.sub("", "\n".join(text_blocks)).strip()
+        if not reply:
+            log.warning("[social_reply] empty model reply; using persona fallback")
+            return fallback_social_reply(kind, requester or "")
+        log.info("[social_reply] DONE kind=%s len=%d", kind, len(reply))
+        return reply
+
+    async def assess_clarification(
+        self,
+        *,
+        thread_text: str,
+        plan: dict,
+        channel: str,
+        reporter: str,
+        max_questions: int = 3,
+    ) -> Optional[dict]:
+        """Decide whether this about-to-be-filed report is missing something
+        essential — and if so, phrase the FEW questions (up to `max_questions`,
+        bundled into one message) to ask the reporter about it.
+
+        Returns {"needs_clarification": bool, "missing": list[str], "questions":
+        list[str], "confidence": float}, or None on any API/parse failure. None means
+        "don't ask": the caller proceeds to the approval embed exactly as before, so a
+        failure here can never stall or lose a report.
+
+        Read/propose only — this decides what to SAY, never what to do.
+        """
+        log.info(
+            "[clarify] step 1/3: assessing plan kind=%s category=%s title=%r",
+            plan.get("kind"),
+            plan.get("category"),
+            plan.get("title"),
+        )
+        assignee = (
+            plan.get("assignee_id")
+            or plan.get("assignee_display")
+            or "(nobody — no owner resolved)"
+        )
+        user_prompt = (
+            f"Channel: #{channel}\n"
+            f"Reporter: {reporter}\n\n"
+            "The ticket you are about to file:\n"
+            f"- Category: {plan.get('category', '?')}\n"
+            f"- Title: {plan.get('title', '?')}\n"
+            f"- Description: {plan.get('description', '') or '(none)'}\n"
+            f"- Labels: {', '.join(plan.get('label_names') or []) or '(none)'}\n"
+            f"- Owner: {assignee}\n"
+            f"- Needs triage (unassigned by convention): "
+            f"{plan.get('kind') == 'create_needs_triage'}\n\n"
+            "The full Discord thread it came from:\n"
+            f"\"\"\"\n{thread_text}\n\"\"\"\n\n"
+            f"Ask AT MOST {max(1, int(max_questions))} question(s), bundled into one "
+            "message. Is something essential missing? Decide now, per the rules above."
+        )
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=300,
+                # The `question` is spoken to the reporter → persona voice.
+                system=cos_preamble() + CLARIFY_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except Exception:
+            log.exception("[clarify] Anthropic call raised; proceeding without asking")
+            return None
+
+        text_blocks = [
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ]
+        if not text_blocks:
+            log.warning("[clarify] no text blocks in response; proceeding without asking")
+            return None
+        parsed = _extract_json("\n".join(text_blocks))
+        if not parsed:
+            log.warning("[clarify] could not extract JSON; proceeding without asking")
+            return None
+
+        log.info("[clarify] step 2/3: raw verdict %r", parsed)
+        needs = bool(parsed.get("needs_clarification", False))
+
+        # Accept the list shape ("questions"/"missing" arrays) and tolerate a model that
+        # still emits the old singular "question"/"missing".
+        raw_qs = parsed.get("questions")
+        if raw_qs is None and parsed.get("question"):
+            raw_qs = [parsed.get("question")]
+        questions = [str(q).strip() for q in (raw_qs or []) if str(q).strip()]
+        questions = questions[: max(1, int(max_questions))]
+
+        raw_missing = parsed.get("missing")
+        if isinstance(raw_missing, str):
+            raw_missing = [raw_missing]
+        allowed = {"repro", "expected_actual", "target", "scope", "owner", "none"}
+        missing = [
+            m for m in (str(x).strip().lower() for x in (raw_missing or []))
+            if m in allowed and m != "none"
+        ]
+
+        try:
+            conf = float(parsed.get("confidence", 0))
+        except (TypeError, ValueError):
+            conf = 0.0
+
+        # A "yes, ask" with no question is not actionable — treat it as "don't ask"
+        # rather than inventing a question or sending an empty message.
+        if needs and not questions:
+            log.warning("[clarify] needs_clarification=true but no questions; not asking")
+            needs = False
+
+        out = {
+            "needs_clarification": needs,
+            "missing": missing,
+            "questions": questions,
+            "confidence": max(0.0, min(1.0, conf)),
+        }
+        log.info(
+            "[clarify] step 3/3: DONE needs=%s missing=%s conf=%.2f questions=%d",
+            out["needs_clarification"],
+            out["missing"],
+            out["confidence"],
+            len(out["questions"]),
+        )
+        return out
+
+    async def detect_commitment(
+        self,
+        *,
+        text: str,
+        author: str,
+        channel: str,
+    ) -> Optional[dict]:
+        """Is this message someone promising to come back with something — and if
+        so, WHAT, and by when?
+
+        Returns {"is_commitment": bool, "what": str, "due_minutes": int|None,
+        "confidence": float} or None on any API/parse failure. `what` is phrased as
+        the thing being awaited ("the DM dates", "the results of the payment test")
+        so it can be quoted straight back in a nudge. `due_minutes` is how long they
+        gave themselves ("in an hour" → 60); None when they named no time.
+
+        Pure extraction — no persona (nothing here is spoken) and no side effects.
+        """
+        log.info(
+            "[commitment] step 1/3: author=%s channel=%s text=%r",
+            author,
+            channel,
+            (text or "")[:120],
+        )
+        user_prompt = (
+            f"Channel: #{channel}\n"
+            f"Speaker: {author}\n\n"
+            f"Their message:\n\"\"\"\n{text}\n\"\"\"\n\n"
+            "Is this a commitment to come back with something? Decide now."
+        )
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=250,
+                system=COMMITMENT_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except Exception:
+            log.exception("[commitment] Anthropic call raised; not tracking this one")
+            return None
+
+        text_blocks = [
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ]
+        if not text_blocks:
+            log.warning("[commitment] no text blocks in response")
+            return None
+        parsed = _extract_json("\n".join(text_blocks))
+        if not parsed:
+            log.warning("[commitment] could not extract JSON")
+            return None
+
+        log.info("[commitment] step 2/3: raw verdict %r", parsed)
+        is_commitment = bool(parsed.get("is_commitment", False))
+        what = str(parsed.get("what", "") or "").strip()
+        try:
+            conf = float(parsed.get("confidence", 0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        due_raw = parsed.get("due_minutes")
+        try:
+            due_minutes = int(due_raw) if due_raw is not None else None
+        except (TypeError, ValueError):
+            log.debug("[commitment] due_minutes=%r unusable; treating as unstated", due_raw)
+            due_minutes = None
+
+        # Nothing to chase without a WHAT — we'd only be able to nudge "any update
+        # on... something?", which is worse than staying quiet.
+        if is_commitment and not what:
+            log.info("[commitment] is_commitment=true but no 'what'; not tracking")
+            is_commitment = False
+
+        out = {
+            "is_commitment": is_commitment,
+            "what": what,
+            "due_minutes": due_minutes,
+            "confidence": max(0.0, min(1.0, conf)),
+        }
+        log.info(
+            "[commitment] step 3/3: DONE is_commitment=%s what=%r due_minutes=%s conf=%.2f",
+            out["is_commitment"],
+            out["what"][:80],
+            out["due_minutes"],
+            out["confidence"],
+        )
+        return out
+
+    async def followup_nudge(
+        self,
+        *,
+        mention: str,
+        what: str,
+        when: str,
+        jump_url: str = "",
+    ) -> str:
+        """The persona-voiced reminder for an aged open thread: "@Ravi — you
+        mentioned the DM dates would be confirmed about an hour ago. Any update?"
+
+        `mention` is pasted verbatim (a Discord <@id> token when we know their ID).
+        Always returns something sendable — on any failure it falls back to
+        `followups.fallback_nudge`, because a nudge that silently doesn't go out is
+        the one failure mode this feature cannot have.
+
+        This writes a REMINDER to a human. It performs no action on their behalf.
+        """
+        log.info(
+            "[nudge] composing: mention=%s what=%r when=%s", mention, what[:80], when
+        )
+        item = {
+            "person_id": None,
+            "person_name": mention,
+            "what": what,
+            "promised_at": "",
+            "jump_url": jump_url,
+        }
+        user_prompt = (
+            f"Who promised (paste this mention token verbatim): {mention}\n"
+            f"What they promised: {what}\n"
+            f"When they promised it: {when}\n"
+            f"Link to their message: {jump_url or '(none)'}\n\n"
+            "Write the nudge now, in your own voice, per the rules above."
+        )
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=200,
+                # Reply path → speak as the Chief-of-Staff persona (voice only).
+                system=cos_preamble() + FOLLOWUP_NUDGE_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except Exception:
+            log.exception("[nudge] Anthropic call raised; using deterministic fallback")
+            return fallback_nudge(item)
+
+        text_blocks = [
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ]
+        nudge = _JSON_FENCE.sub("", "\n".join(text_blocks)).strip()
+        if not nudge:
+            log.warning("[nudge] empty model reply; using deterministic fallback")
+            return fallback_nudge(item)
+
+        # The model was told to paste the mention verbatim; if it paraphrased it
+        # away, the person never gets pinged — so put it back on the front.
+        if mention.startswith("<@") and mention not in nudge:
+            log.info("[nudge] model dropped the mention token; prepending it")
+            nudge = f"{mention} — {nudge}"
+
+        log.info("[nudge] DONE len=%d", len(nudge))
+        return nudge
+
+    async def assess_issue_gap(self, *, issue: dict) -> Optional[dict]:
+        """The MODEL-JUDGED half of the escalation ladder: is this launch-critical issue
+        missing a repro, or too vague to build?
+
+        (The other half — no due date, stuck In Progress, unassigned — is deterministic
+        and needs no model; see `escalation.find_gaps`.)
+
+        Returns {"gap": "missing_repro"|"vague_scope"|"none", "detail": str,
+        "confidence": float}, or None on any API/parse failure — which the caller treats
+        as "no gap", so a model outage means silence, never a bad nudge.
+        """
+        ident = issue.get("identifier") or "?"
+        log.info("[issue_gap] step 1/3: assessing %s", ident)
+        desc = (issue.get("description") or "").strip()
+        user_prompt = (
+            f"Issue: {ident}\n"
+            f"Title: {issue.get('title') or '(none)'}\n"
+            f"State: {issue.get('state') or '?'}\n"
+            f"Labels: {', '.join(issue.get('labels') or []) or '(none)'}\n"
+            f"Assignee: {issue.get('assignee') or '(unassigned)'}\n"
+            f"Project: {issue.get('project') or '(none)'}\n\n"
+            "Description:\n"
+            f"\"\"\"\n{desc or '(empty)'}\n\"\"\"\n\n"
+            "Is this missing something that blocks the work? Decide now."
+        )
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=250,
+                system=cos_preamble() + ISSUE_GAP_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except Exception:
+            log.exception("[issue_gap] Anthropic call raised; treating %s as no-gap", ident)
+            return None
+
+        text_blocks = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+        if not text_blocks:
+            log.warning("[issue_gap] no text blocks for %s", ident)
+            return None
+        parsed = _extract_json("\n".join(text_blocks))
+        if not parsed:
+            log.warning("[issue_gap] could not extract JSON for %s", ident)
+            return None
+
+        gap = str(parsed.get("gap", "none") or "none").strip().lower()
+        if gap not in {"missing_repro", "vague_scope", "none"}:
+            log.debug("[issue_gap] unknown gap %r for %s; normalising to none", gap, ident)
+            gap = "none"
+        try:
+            conf = float(parsed.get("confidence", 0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        detail = str(parsed.get("detail", "") or "").strip()
+
+        # A gap we can't describe isn't one we can ask about.
+        if gap != "none" and not detail:
+            log.info("[issue_gap] %s: gap=%s but no detail; treating as none", ident, gap)
+            gap = "none"
+
+        out = {"gap": gap, "detail": detail, "confidence": max(0.0, min(1.0, conf))}
+        log.info(
+            "[issue_gap] step 3/3: DONE %s gap=%s conf=%.2f detail=%r",
+            ident, out["gap"], out["confidence"], out["detail"][:80],
+        )
+        return out
+
+    async def assess_issue_comments(
+        self, *, issue: dict, comments: list[dict], gap_kind: str, today: str
+    ) -> Optional[dict]:
+        """CHECK-BEFORE-TAGGING (point 2): read an issue's comments before pinging its
+        assignee about `gap_kind`, and decide whether the comments already resolve the gap,
+        reveal a blocker that belongs with the PMs, or neither.
+
+        Returns {"resolves_gap": bool, "found_deadline": "YYYY-MM-DD"|"", "blocker": bool,
+        "escalate_to_pm": bool, "reason": str, "evidence": str, "confidence": float}, or
+        None on any API/parse failure — which the caller treats as "no signal, go ahead and
+        tag" (a model outage must not silently swallow a nudge). Read-only.
+        """
+        ident = issue.get("identifier") or "?"
+        log.info(
+            "[comment_check] step 1/2: %s gap=%s comments=%d", ident, gap_kind, len(comments or [])
+        )
+        if not comments:
+            # Nothing to read — no comment can resolve the gap or show a blocker.
+            return {
+                "resolves_gap": False, "found_deadline": "", "blocker": False,
+                "escalate_to_pm": False, "reason": "", "evidence": "", "confidence": 1.0,
+            }
+        rendered = "\n".join(
+            f"- [{c.get('createdAt') or '?'}] {c.get('author') or 'someone'}: "
+            f"{(c.get('body') or '').strip()}"
+            for c in comments
+        )[:4000]
+        user_prompt = (
+            f"Today: {today}\n"
+            f"The gap you were about to ask about: {gap_kind}\n"
+            f"Issue: {ident} ({issue.get('title') or ''})\n"
+            f"State: {issue.get('state') or '?'}\n"
+            f"Assignee: {issue.get('assignee') or '(unassigned)'}\n\n"
+            "Comments (oldest first):\n"
+            f"{rendered}\n\n"
+            "Decide the outcome now."
+        )
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=350,
+                system=cos_preamble() + COMMENT_ASSESS_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except Exception:
+            log.exception("[comment_check] Anthropic call raised for %s; treating as no-signal", ident)
+            return None
+
+        text_blocks = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+        parsed = _extract_json("\n".join(text_blocks)) if text_blocks else None
+        if not parsed:
+            log.warning("[comment_check] could not parse verdict for %s", ident)
+            return None
+
+        def _b(key):
+            return bool(parsed.get(key))
+
+        deadline = str(parsed.get("found_deadline", "") or "").strip()
+        if not _DATE_ONLY_RE.match(deadline):
+            deadline = ""
+        try:
+            conf = float(parsed.get("confidence", 0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        out = {
+            "resolves_gap": _b("resolves_gap") and bool(deadline) if gap_kind == escalation.MISSING_DUE_DATE else _b("resolves_gap"),
+            "found_deadline": deadline,
+            "blocker": _b("blocker"),
+            "escalate_to_pm": _b("blocker") and _b("escalate_to_pm"),
+            "reason": str(parsed.get("reason", "") or "").strip(),
+            "evidence": str(parsed.get("evidence", "") or "").strip(),
+            "confidence": max(0.0, min(1.0, conf)),
+        }
+        log.info(
+            "[comment_check] step 2/2: DONE %s resolves=%s deadline=%r blocker=%s pm=%s conf=%.2f",
+            ident, out["resolves_gap"], out["found_deadline"], out["blocker"],
+            out["escalate_to_pm"], out["confidence"],
+        )
+        return out
+
+    async def extract_deadline(self, *, text: str, today: str) -> Optional[dict]:
+        """Extract a concrete deadline (resolved to an absolute YYYY-MM-DD) from a free-text
+        `text` — a Discord reply, an issue comment, or a standup line — relative to `today`.
+
+        Returns {"date": "YYYY-MM-DD"|"", "quote": str, "confidence": float}, or None on
+        API/parse failure. An empty date means "no actionable date found" (vague/unrelated).
+        Read-only.
+        """
+        body = (text or "").strip()
+        if not body:
+            return {"date": "", "quote": "", "confidence": 1.0}
+        # Fast path: an explicit ISO date in the text needs no model call.
+        iso = _DATE_ANYWHERE_RE.search(body)
+        if iso and _valid_iso(iso.group(0)):
+            return {"date": iso.group(0), "quote": iso.group(0), "confidence": 0.95}
+        user_prompt = f"Today: {today}\n\nText:\n\"\"\"\n{body[:1500]}\n\"\"\"\n\nExtract the deadline now."
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=150,
+                system=cos_preamble() + DEADLINE_EXTRACT_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except Exception:
+            log.exception("[deadline] Anthropic call raised; no date")
+            return None
+        text_blocks = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+        parsed = _extract_json("\n".join(text_blocks)) if text_blocks else None
+        if not parsed:
+            return None
+        date_str = str(parsed.get("date", "") or "").strip()
+        if not (_DATE_ONLY_RE.match(date_str) and _valid_iso(date_str)):
+            date_str = ""
+        try:
+            conf = float(parsed.get("confidence", 0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        return {
+            "date": date_str,
+            "quote": str(parsed.get("quote", "") or "").strip(),
+            "confidence": max(0.0, min(1.0, conf)),
+        }
+
+    async def compose_escalation(
+        self,
+        *,
+        level: str,
+        mentions: str,
+        finding: dict,
+    ) -> str:
+        """The persona-voiced nudge for ONE finding — level "assignee" (ask the owner
+        for the missing piece) or "pm" (state the situation, hand the PMs the call).
+
+        `mentions` is the already-resolved audience string ("<@1> <@2>", or a plain name
+        when someone isn't mapped to a Discord id) — the classifier never resolves people
+        and never decides who to tag.
+
+        Always returns something sendable: on any failure it falls back to
+        `escalation.fallback_message`. This composes a MESSAGE ASKING A HUMAN — it is
+        never a Linear write, and the prompt forbids claiming otherwise.
+        """
+        level = (level or escalation.LEVEL_ASSIGNEE).strip().lower()
+        if level not in {escalation.LEVEL_ASSIGNEE, escalation.LEVEL_PM}:
+            level = escalation.LEVEL_ASSIGNEE
+        ident = finding.get("issue_id") or "?"
+        log.info("[escalate] composing level=%s for %s (%s)", level, ident, finding.get("kind"))
+
+        launch = escalation.describe_launch(finding.get("launch"))
+        user_prompt = (
+            f"Level: {level}\n"
+            f"Who to address (paste these tokens verbatim): {mentions}\n"
+            f"Issue: {ident} ({finding.get('issue_title') or ''})\n"
+            f"State: {finding.get('issue_state') or '?'}\n"
+            f"Assignee: {finding.get('assignee') or '(unassigned)'}\n"
+            f"The situation: this issue {finding.get('detail') or 'needs attention'}\n"
+            f"Launch pressure: {launch or '(none — do not invent one)'}\n"
+            f"Link: {finding.get('issue_url') or '(none)'}\n\n"
+            "Write the message now, in your own voice, per the rules above."
+        )
+        try:
+            resp = await asyncio.to_thread(
+                self._client.messages.create,
+                model=self._model,
+                max_tokens=250,
+                system=cos_preamble() + ESCALATION_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except Exception:
+            log.exception("[escalate] Anthropic call raised; using deterministic fallback")
+            return escalation.fallback_message(finding, mentions)
+
+        text_blocks = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+        msg = _JSON_FENCE.sub("", "\n".join(text_blocks)).strip()
+        if not msg:
+            log.warning("[escalate] empty model reply; using deterministic fallback")
+            return escalation.fallback_message(finding, mentions)
+
+        # The model was told to paste the mention tokens verbatim. If it dropped one,
+        # the person it was FOR never sees it — so put the audience back on the front.
+        missing = [t for t in mentions.split() if t.startswith("<@") and t not in msg]
+        if missing:
+            log.info("[escalate] model dropped mention token(s) %s; prepending", missing)
+            msg = f"{' '.join(missing)} {msg}"
+
+        log.info("[escalate] DONE level=%s %s len=%d", level, ident, len(msg))
+        return msg
 
     async def summarize_person_activity(
         self,
@@ -623,7 +1362,8 @@ class Classifier:
                 self._client.messages.create,
                 model=self._model,
                 max_tokens=700,
-                system=PERSON_ACTIVITY_SYNTHESIS_PROMPT,
+                # Reply path → speak as the Chief-of-Staff persona (voice only).
+                system=cos_preamble() + PERSON_ACTIVITY_SYNTHESIS_PROMPT,
                 messages=[{"role": "user", "content": user_prompt}],
             )
         except Exception:

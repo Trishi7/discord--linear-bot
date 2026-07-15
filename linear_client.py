@@ -13,9 +13,12 @@ What this bot needs:
   - best-effort issue search by title / key terms.
 """
 import logging
+import re
 from typing import Optional
 
 import httpx
+
+from conventions import PROJECT_ALIASES
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +76,18 @@ mutation CreateComment($input: CommentCreateInput!) {
   commentCreate(input: $input) {
     success
     comment { id url }
+  }
+}
+"""
+
+# The ONE sanctioned Linear write beyond create/comment: set an issue's due date. Kept as
+# its own mutation (returning dueDate) so the caller can confirm what landed, and so the
+# input can NEVER carry a stateId/assigneeId by construction — this path sets dueDate only.
+_SET_DUE_DATE = """
+mutation SetDueDate($id: String!, $dueDate: TimelessDate!) {
+  issueUpdate(id: $id, input: { dueDate: $dueDate }) {
+    success
+    issue { id identifier dueDate }
   }
 }
 """
@@ -217,6 +232,41 @@ query ListIssues($filter: IssueFilter!, $first: Int!) {
 """
 
 
+# READ-ONLY projection for the Chief-of-Staff gap audit (see escalation.py). It is
+# deliberately its OWN query rather than a widening of _LIST_ISSUES: the audit needs
+# fields no other caller wants (`description` to judge repro/scope, `startedAt` to age
+# an In Progress issue, and the issue's PROJECT TARGET DATE to know a launch is close),
+# and _LIST_ISSUES feeds the query engine, where a fatter payload costs tokens on every
+# question. `comments(last: 1)` is how we tell "stuck with no explanation" from "stuck,
+# and someone said why".
+_AUDIT_ISSUES = """
+query AuditIssues($filter: IssueFilter!, $first: Int!) {
+  issues(filter: $filter, first: $first, orderBy: updatedAt) {
+    nodes {
+      id
+      identifier
+      title
+      description
+      url
+      priority
+      dueDate
+      createdAt
+      updatedAt
+      startedAt
+      state { name type }
+      labels { nodes { name } }
+      assignee { displayName name email }
+      creator { displayName name email }
+      project { id name targetDate state }
+      comments(last: 1) {
+        nodes { body createdAt user { displayName name } }
+      }
+    }
+  }
+}
+"""
+
+
 _ASSIGNED_ISSUES = """
 query AssignedIssues($filter: IssueFilter!, $first: Int!) {
   issues(filter: $filter, first: $first, orderBy: updatedAt) {
@@ -227,6 +277,84 @@ query AssignedIssues($filter: IssueFilter!, $first: Int!) {
       updatedAt
       priority
       state { name type }
+    }
+  }
+}
+"""
+
+
+# READ-ONLY project catalog for the query engine's PROJECT-level answers. Scoped to
+# the configured team (team.projects) so the bot only sees NFThing2.0 projects, not
+# the whole workspace. This LIGHT query deliberately omits milestones: Linear rejects
+# a query whose complexity exceeds 10000, and projectMilestones(first:50) fanned out
+# across `first` projects blows that budget. Milestones are fetched per-project by id
+# via `_PROJECT_DETAIL` instead. `description` is the full markdown; callers derive a
+# one-line summary from it.
+_TEAM_PROJECTS = """
+query TeamProjects($teamId: String!, $first: Int!) {
+  team(id: $teamId) {
+    projects(first: $first) {
+      nodes {
+        id
+        name
+        description
+        url
+        startDate
+        targetDate
+        priority
+        progress
+        health
+        status { name type }
+        lead { displayName name email }
+      }
+    }
+  }
+}
+"""
+
+# Full detail for ONE project by id — including MILESTONES. `projectMilestones` is the
+# field name on Project (NOT `milestones`); many projects have none, which is normal.
+# Fetched per-project (not fanned across the whole team) to stay under the API's
+# query-complexity ceiling.
+_PROJECT_DETAIL = """
+query ProjectDetail($id: String!) {
+  project(id: $id) {
+    id
+    name
+    description
+    url
+    startDate
+    targetDate
+    priority
+    progress
+    health
+    status { name type }
+    lead { displayName name email }
+    projectMilestones(first: 50) {
+      nodes { id name targetDate description sortOrder }
+    }
+  }
+}
+"""
+
+# Issues within one project, with the per-issue MILESTONE so the engine can roll up
+# "6 of 8 dev-complete" by milestone, and the label/state/assignee/dueDate fields a
+# project drill-down needs. Filtered by project id (team included for safety).
+_PROJECT_ISSUES = """
+query ProjectIssues($filter: IssueFilter!, $first: Int!) {
+  issues(filter: $filter, first: $first, orderBy: updatedAt) {
+    nodes {
+      id
+      identifier
+      title
+      url
+      priority
+      dueDate
+      updatedAt
+      state { name type }
+      labels { nodes { name } }
+      assignee { displayName name email }
+      projectMilestone { id name targetDate }
     }
   }
 }
@@ -376,6 +504,92 @@ def _issue_node_to_dict(node: dict) -> dict:
         "state_history": state_history,
         "state_entered": state_entered,
         "latest_comment": latest_comment,
+    }
+
+
+def _project_summary(description: Optional[str]) -> Optional[str]:
+    """First meaningful line of a project's markdown description — a one-line
+    summary for list_projects. Strips leading heading hashes; caps length."""
+    for line in (description or "").splitlines():
+        s = line.strip().lstrip("#").strip().strip("*").strip()
+        if s:
+            return s if len(s) <= 240 else s[:237] + "…"
+    return None
+
+
+def _project_node_to_dict(node: dict) -> dict:
+    """Normalise a Project GraphQL node into the dict shape the engine tools return.
+    Includes the milestone list (name + target date), sorted by the project's own
+    ordering; issue counts are attached later by the caller from the project's issues."""
+    lead = node.get("lead") or {}
+    status = node.get("status") or {}
+    prio_raw = node.get("priority")
+    progress = node.get("progress")
+    milestones: list[dict] = []
+    for m in (node.get("projectMilestones") or {}).get("nodes") or []:
+        if not m or not m.get("id"):
+            continue
+        desc = (m.get("description") or "").strip()
+        milestones.append(
+            {
+                "id": m.get("id"),
+                "name": m.get("name"),
+                "target_date": m.get("targetDate"),
+                "description": desc or None,
+                "_sort": m.get("sortOrder") if m.get("sortOrder") is not None else 0.0,
+            }
+        )
+    milestones.sort(key=lambda x: x["_sort"])
+    for m in milestones:
+        m.pop("_sort", None)
+
+    description = (node.get("description") or "").strip()
+    return {
+        "id": node.get("id"),
+        "name": node.get("name"),
+        "description": description or None,
+        "summary": _project_summary(description),
+        "url": node.get("url"),
+        "start_date": node.get("startDate"),
+        "target_date": node.get("targetDate"),
+        "priority": _PRIORITY_LABEL.get(prio_raw) if prio_raw is not None else None,
+        "priority_value": prio_raw,
+        "progress_pct": round(progress * 100) if progress is not None else None,
+        "health": node.get("health"),
+        "status": status.get("name"),
+        "status_type": status.get("type"),
+        "lead": lead.get("displayName") or lead.get("name"),
+        "milestones": milestones,
+    }
+
+
+def _project_issue_node_to_dict(node: dict) -> dict:
+    """Compact per-issue projection for the project drill-down: identifier, title,
+    state, label, assignee, milestone, dueDate, updatedAt (+ priority, url)."""
+    labels = [
+        lab.get("name")
+        for lab in (node.get("labels") or {}).get("nodes") or []
+        if lab.get("name")
+    ]
+    assignee = node.get("assignee") or {}
+    state = node.get("state") or {}
+    milestone = node.get("projectMilestone") or {}
+    prio_raw = node.get("priority")
+    return {
+        "identifier": node.get("identifier"),
+        "title": node.get("title"),
+        "url": node.get("url"),
+        "state": state.get("name"),
+        "state_type": state.get("type"),
+        "labels": labels,
+        "assignee": assignee.get("displayName") or assignee.get("name"),
+        "milestone": milestone.get("name"),
+        "milestone_id": milestone.get("id"),
+        "milestone_target_date": milestone.get("targetDate"),
+        "priority": _PRIORITY_LABEL.get(prio_raw) if prio_raw is not None else None,
+        "priority_value": prio_raw,
+        "dueDate": node.get("dueDate"),
+        "updatedAt": node.get("updatedAt"),
     }
 
 
@@ -786,6 +1000,37 @@ class LinearClient:
         )
         return result["issue"]
 
+    async def set_issue_due_date(self, issue_id: str, due_date: str) -> Optional[dict]:
+        """WRITE: set/update ONE issue's due date to `due_date` ("YYYY-MM-DD").
+
+        This is the CoS "close the loop" write (COS_UPDATE_DEADLINE_ENABLED). It sets the
+        DUE DATE and NOTHING else — the mutation's input can't carry a state or assignee —
+        so it can never move or reassign an issue. Pair it with `add_comment` to note the
+        new date and its source (the caller does that). Returns the updated issue
+        {id, identifier, dueDate} or None on failure. Logs and swallows errors — the
+        deadline path degrades to "did nothing", never to raising into the sweeper.
+        """
+        iid = str(issue_id or "").strip()
+        dd = str(due_date or "").strip()
+        log.info("[linear.set_issue_due_date] step 1/2: issue=%s dueDate=%s", iid, dd)
+        if not iid or not dd:
+            log.warning("[linear.set_issue_due_date] missing issue id or date; no-op")
+            return None
+        try:
+            data = await self._gql(_SET_DUE_DATE, {"id": iid, "dueDate": dd})
+        except Exception:
+            log.exception("[linear.set_issue_due_date] issueUpdate failed; no-op")
+            return None
+        result = data.get("issueUpdate") or {}
+        if not result.get("success") or not result.get("issue"):
+            log.error("[linear.set_issue_due_date] returned non-success: %s", result)
+            return None
+        log.info(
+            "[linear.set_issue_due_date] DONE: %s dueDate now %s",
+            result["issue"].get("identifier"), result["issue"].get("dueDate"),
+        )
+        return result["issue"]
+
     # -- reads ---------------------------------------------------------------
 
     async def get_issue(self, id_or_identifier: str) -> Optional[dict]:
@@ -842,6 +1087,90 @@ class LinearClient:
         results = [_issue_node_to_dict(n) for n in nodes if n]
         log.info("[linear.list_issues] step 2/2: %d results", len(results))
         return results
+
+    async def list_open_issues_for_audit(self, *, limit: int = 50) -> list[dict]:
+        """READ-ONLY: the team's OPEN issues, with the extra fields the Chief-of-Staff
+        gap audit needs — `description` (to judge a missing repro / vague scope),
+        `startedAt` (to age an In Progress issue), the latest comment (to tell "stuck
+        with no explanation" from "stuck, and someone explained"), and the issue's
+        PROJECT with its `targetDate` (so a launch-milestone issue can be spotted as
+        its deadline approaches).
+
+        Open = backlog | unstarted | started | triage. Completed and cancelled issues
+        are never chased. Returns [] on any error — the audit degrades to doing
+        nothing, never to raising into the sweeper. This method only READS; nothing in
+        the escalation path writes to Linear.
+        """
+        f = {
+            "team": {"id": {"eq": self._team_id}},
+            "state": {"type": {"in": ["backlog", "unstarted", "started", "triage"]}},
+        }
+        log.info("[linear.audit] step 1/2: fetching open issues (limit=%d)", limit)
+        try:
+            data = await self._gql(_AUDIT_ISSUES, {"filter": f, "first": int(limit)})
+        except Exception:
+            log.exception("[linear.audit] failed; returning [] (audit no-ops)")
+            return []
+
+        nodes = (data.get("issues") or {}).get("nodes") or []
+        out: list[dict] = []
+        for n in nodes:
+            if not n:
+                continue
+            row = _issue_node_to_dict(n)
+            # `_issue_node_to_dict` flattens project to its NAME only; the audit needs
+            # the target date too, so carry the full project through alongside it.
+            proj = n.get("project") or {}
+            row["project_id"] = proj.get("id")
+            row["project_target_date"] = proj.get("targetDate")
+            row["project_state"] = proj.get("state")
+            out.append(row)
+        log.info("[linear.audit] step 2/2: %d open issue(s)", len(out))
+        return out
+
+    async def list_active_issues_for_audit(
+        self, *, state_names: list[str], limit: int = 50
+    ) -> list[dict]:
+        """READ-ONLY: the team's ACTIVE issues for the escalation/tagging audit — those
+        whose workflow-state NAME is in `state_names` (e.g. In Progress / Implemented /
+        awaiting QA / In Review). Same rich projection as `list_open_issues_for_audit`
+        (description, started_at, latest comment, project + target date).
+
+        Filtered by state NAME server-side (not TYPE): these states share the
+        "started"/"completed" type, so only the name distinguishes "actively being worked"
+        from Backlog/Todo/Done/Canceled. Empty `state_names` → [] (chase nothing) rather
+        than accidentally auditing everything. Returns [] on any error — never raises.
+        """
+        names = [s for s in (state_names or []) if s and s.strip()]
+        if not names:
+            log.info("[linear.audit_active] no state names given; returning [] (chase nothing)")
+            return []
+        f = {
+            "team": {"id": {"eq": self._team_id}},
+            "state": {"name": {"in": names}},
+        }
+        log.info(
+            "[linear.audit_active] step 1/2: fetching active issues by name=%s (limit=%d)",
+            names, limit,
+        )
+        try:
+            data = await self._gql(_AUDIT_ISSUES, {"filter": f, "first": int(limit)})
+        except Exception:
+            log.exception("[linear.audit_active] failed; returning [] (audit no-ops)")
+            return []
+        nodes = (data.get("issues") or {}).get("nodes") or []
+        out: list[dict] = []
+        for n in nodes:
+            if not n:
+                continue
+            row = _issue_node_to_dict(n)
+            proj = n.get("project") or {}
+            row["project_id"] = proj.get("id")
+            row["project_target_date"] = proj.get("targetDate")
+            row["project_state"] = proj.get("state")
+            out.append(row)
+        log.info("[linear.audit_active] step 2/2: %d active issue(s)", len(out))
+        return out
 
     async def active_issues_for_user(
         self,
@@ -1273,4 +1602,297 @@ class LinearClient:
 
         out = rows[: max(1, int(limit))]
         log.info("[linear.list_issues_query] step 2/2: %d result(s)", len(out))
+        return out
+
+    # -- engine-facing reads: PROJECT-level (tool-driven query mode) ----------
+
+    async def _fetch_team_projects(self, *, limit: int = 50) -> list[dict]:
+        """Fetch + normalise the configured team's projects (LIGHT — no milestones;
+        see `_TEAM_PROJECTS`). `limit` is capped at 50 to stay under the Linear
+        query-complexity ceiling. Raises on transport/GraphQL error — public callers
+        wrap and degrade."""
+        data = await self._gql(
+            _TEAM_PROJECTS, {"teamId": self._team_id, "first": min(int(limit), 50)}
+        )
+        nodes = ((data.get("team") or {}).get("projects") or {}).get("nodes") or []
+        return [_project_node_to_dict(n) for n in nodes if n and n.get("id")]
+
+    async def _fetch_project_detail(self, project_id: str) -> Optional[dict]:
+        """Fetch ONE project by id WITH its milestones. Returns the normalised dict or
+        None if not found. Raises on transport/GraphQL error — callers wrap."""
+        data = await self._gql(_PROJECT_DETAIL, {"id": project_id})
+        node = data.get("project")
+        return _project_node_to_dict(node) if node else None
+
+    def _match_project(self, name: str, projects: list[dict]) -> dict:
+        """Resolve a free-text project `name` to ONE project from `projects`.
+
+        Order: alias map (conventions.PROJECT_ALIASES) → exact name (case-insensitive)
+        → substring either direction → token overlap. Returns {"project": <dict>} on a
+        single confident match, or {"error", "candidates"} when nothing / several match
+        (same shape as resolve_member_id). Never raises."""
+        wanted = (name or "").strip().lower()
+        if not wanted:
+            return {"error": "empty project name", "candidates": []}
+
+        # An alias points the term at a canonical project name; add it as an extra
+        # target so the exact/substring passes below can hit it.
+        targets = {wanted}
+        alias = PROJECT_ALIASES.get(wanted)
+        if alias:
+            targets.add(alias.strip().lower())
+
+        def _cands(ps: list[dict]) -> list[dict]:
+            return [
+                {"name": p.get("name"), "target_date": p.get("target_date"),
+                 "status": p.get("status")}
+                for p in ps
+            ]
+
+        # 1) Exact name match (covers the alias → canonical-name case).
+        exact = [p for p in projects if (p.get("name") or "").strip().lower() in targets]
+        if len(exact) == 1:
+            return {"project": exact[0]}
+        if len(exact) > 1:
+            return {"error": f"'{name}' matches multiple projects", "candidates": _cands(exact)}
+
+        # 2) Substring either direction (e.g. "onboarding" ⊂ "KYC + Aadhaar Onboarding").
+        subs = [
+            p for p in projects
+            if any(
+                t in (p.get("name") or "").strip().lower()
+                or (p.get("name") or "").strip().lower() in t
+                for t in targets
+            )
+        ]
+        if len(subs) == 1:
+            return {"project": subs[0]}
+        if len(subs) > 1:
+            return {"error": f"'{name}' matches multiple projects", "candidates": _cands(subs)}
+
+        # 3) Token overlap — last resort for partial phrasings.
+        want_toks = {t for t in re.findall(r"[a-z0-9]+", wanted) if len(t) >= 3}
+        toks_hits = []
+        for p in projects:
+            pn_toks = set(re.findall(r"[a-z0-9]+", (p.get("name") or "").lower()))
+            if want_toks & pn_toks:
+                toks_hits.append(p)
+        if len(toks_hits) == 1:
+            return {"project": toks_hits[0]}
+        if len(toks_hits) > 1:
+            return {"error": f"'{name}' matches multiple projects", "candidates": _cands(toks_hits)}
+
+        return {"error": f"no project matches '{name}'", "candidates": _cands(projects)}
+
+    async def _resolve_project(self, name: str) -> dict:
+        """Fetch the team projects and match `name` against them. Returns
+        {"project": <dict>} or {"error", "candidates"}. Never raises."""
+        try:
+            projects = await self._fetch_team_projects()
+        except Exception:
+            log.exception("[linear._resolve_project] project fetch failed")
+            return {"error": "could not load projects", "candidates": []}
+        return self._match_project(name, projects)
+
+    async def _project_issue_rows(
+        self,
+        project_id: str,
+        *,
+        label_names: Optional[list[str]] = None,
+        state_types: Optional[list[str]] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """All issues in a project (by id), newest-updated first, as compact rows.
+        Optional label / state-type filters are AND-ed. Raises on error; callers wrap."""
+        f: dict = {
+            "team": {"id": {"eq": self._team_id}},
+            "project": {"id": {"eq": project_id}},
+        }
+        if state_types:
+            f["state"] = {"type": {"in": list(state_types)}}
+        if label_names:
+            f["labels"] = {"some": {"name": {"in": list(label_names)}}}
+        data = await self._gql(_PROJECT_ISSUES, {"filter": f, "first": int(limit)})
+        nodes = (data.get("issues") or {}).get("nodes") or []
+        rows = [_project_issue_node_to_dict(n) for n in nodes if n]
+        rows.sort(key=lambda r: r.get("updatedAt") or "", reverse=True)
+        return rows
+
+    @staticmethod
+    def _rollup_by_milestone(project: dict, issues: list[dict]) -> None:
+        """Attach issue_total / issue_completed to each milestone in `project` from
+        `issues` (matched by milestone id). Mutates the milestone dicts in place."""
+        by_ms: dict = {}
+        for it in issues:
+            mid = it.get("milestone_id")
+            slot = by_ms.setdefault(mid, {"total": 0, "completed": 0})
+            slot["total"] += 1
+            if it.get("state_type") == "completed":
+                slot["completed"] += 1
+        for m in project.get("milestones") or []:
+            c = by_ms.get(m.get("id"), {"total": 0, "completed": 0})
+            m["issue_total"] = c["total"]
+            m["issue_completed"] = c["completed"]
+
+    async def list_projects(self) -> list[dict]:
+        """READ-ONLY: the team's projects as [{name, target_date, lead, status,
+        priority, progress_pct, summary, milestone_count, url}], for resolving a
+        spoken feature name ("DMs") to a real project and for a project overview.
+        Returns [] on any error. Never raises."""
+        log.info("[linear.list_projects] step 1/2: team %s", self._team_id)
+        try:
+            projects = await self._fetch_team_projects()
+        except Exception:
+            log.exception("[linear.list_projects] failed; returning []")
+            return []
+        out = [
+            {
+                "name": p.get("name"),
+                "target_date": p.get("target_date"),
+                "lead": p.get("lead"),
+                "status": p.get("status"),
+                "priority": p.get("priority"),
+                "progress_pct": p.get("progress_pct"),
+                "summary": p.get("summary"),
+                "milestone_count": len(p.get("milestones") or []),
+                "url": p.get("url"),
+            }
+            for p in projects
+        ]
+        log.info("[linear.list_projects] step 2/2: %d project(s)", len(out))
+        return out
+
+    async def get_project(self, name: str) -> dict:
+        """READ-ONLY full detail for ONE project resolved from `name` (alias/fuzzy).
+
+        Returns the project meta (name, summary, description, url, start/target dates,
+        lead, status, priority, progress, health), its MILESTONES (each with
+        target_date and issue_total / issue_completed), and an issue_totals rollup
+        (total + counts by state name and by state type) so the engine can lead with
+        the launch picture. Returns {"error", "candidates"} when the name doesn't
+        resolve to exactly one project. Never raises."""
+        log.info("[linear.get_project] step 1/3: resolving %r", name)
+        res = await self._resolve_project(name)
+        if "project" not in res:
+            log.info("[linear.get_project] step 2/3: no single match (%s)", res.get("error"))
+            return res
+        p = dict(res["project"])
+
+        # The resolve pass uses the LIGHT project query (no milestones). Re-fetch this
+        # one project's full detail so milestones are populated; fall back to the light
+        # dict if the detail fetch fails.
+        try:
+            detail = await self._fetch_project_detail(p["id"])
+            if detail:
+                p = detail
+        except Exception:
+            log.exception("[linear.get_project] detail fetch failed; using light dict")
+
+        log.info("[linear.get_project] step 2/3: matched %r; loading issues", p.get("name"))
+        try:
+            issues = await self._project_issue_rows(p["id"])
+        except Exception:
+            log.exception("[linear.get_project] issue load failed; counts omitted")
+            issues = []
+
+        self._rollup_by_milestone(p, issues)
+        by_state_name: dict = {}
+        by_state_type: dict = {}
+        for it in issues:
+            sn = it.get("state") or "Unknown"
+            st = it.get("state_type") or "unknown"
+            by_state_name[sn] = by_state_name.get(sn, 0) + 1
+            by_state_type[st] = by_state_type.get(st, 0) + 1
+        p["issue_totals"] = {
+            "total": len(issues),
+            "by_state_name": by_state_name,
+            "by_state_type": by_state_type,
+        }
+        # Drop the id from the public payload — the engine addresses projects by name.
+        p.pop("id", None)
+        for m in p.get("milestones") or []:
+            m.pop("id", None)
+        log.info(
+            "[linear.get_project] step 3/3: %r — %d issue(s), %d milestone(s)",
+            p.get("name"), len(issues), len(p.get("milestones") or []),
+        )
+        return p
+
+    async def get_project_issues(
+        self,
+        name: str,
+        *,
+        label_names: Optional[list[str]] = None,
+        state_types: Optional[list[str]] = None,
+        limit: int = 100,
+    ) -> dict:
+        """READ-ONLY: all issues in the project resolved from `name`, each with
+        identifier, title, state, labels, assignee, milestone, dueDate, updatedAt
+        (+ priority, url). Optional label_names (e.g. ['FE']) and state_types filters
+        AND-ed — use them for "any FE/BE work left for X". Returns
+        {project, target_date, issues:[...]} or {"error", "candidates"} when the name
+        doesn't resolve. Never raises."""
+        log.info(
+            "[linear.get_project_issues] step 1/2: name=%r labels=%s state_types=%s",
+            name, label_names, state_types,
+        )
+        res = await self._resolve_project(name)
+        if "project" not in res:
+            return res
+        p = res["project"]
+        try:
+            issues = await self._project_issue_rows(
+                p["id"], label_names=label_names, state_types=state_types, limit=limit
+            )
+        except Exception:
+            log.exception("[linear.get_project_issues] issue load failed; returning []")
+            issues = []
+        # Strip internal milestone_id from the per-issue rows.
+        for it in issues:
+            it.pop("milestone_id", None)
+        log.info("[linear.get_project_issues] step 2/2: %d issue(s)", len(issues))
+        return {
+            "project": p.get("name"),
+            "target_date": p.get("target_date"),
+            "issues": issues,
+        }
+
+    async def list_milestones(self, name: str) -> dict:
+        """READ-ONLY: milestones of the project resolved from `name`, each with
+        target_date and completion (issue_total / issue_completed). Returns
+        {project, target_date, milestones:[...]} — milestones is [] (with a note) when
+        the project has none, which is common. {"error", "candidates"} when the name
+        doesn't resolve. Never raises."""
+        log.info("[linear.list_milestones] step 1/2: resolving %r", name)
+        res = await self._resolve_project(name)
+        if "project" not in res:
+            return res
+        p = dict(res["project"])
+        # Light resolve dict has no milestones — re-fetch this project's detail.
+        try:
+            detail = await self._fetch_project_detail(p["id"])
+            if detail:
+                p = detail
+        except Exception:
+            log.exception("[linear.list_milestones] detail fetch failed; using light dict")
+        try:
+            issues = await self._project_issue_rows(p["id"])
+        except Exception:
+            log.exception("[linear.list_milestones] issue load failed; counts omitted")
+            issues = []
+        self._rollup_by_milestone(p, issues)
+        milestones = [
+            {k: v for k, v in m.items() if k != "id"} for m in p.get("milestones") or []
+        ]
+        out: dict = {
+            "project": p.get("name"),
+            "target_date": p.get("target_date"),
+            "milestones": milestones,
+        }
+        if not milestones:
+            out["note"] = (
+                "This project has no milestones defined — use its target date "
+                "for the launch/release date and roll up its issues by state."
+            )
+        log.info("[linear.list_milestones] step 2/2: %d milestone(s)", len(milestones))
         return out

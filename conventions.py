@@ -80,3 +80,37 @@ TITLE STYLE (from real done tickets) — short, specific, "<Area/Feature> — <w
   "Pulse — reporting feature"
   "Birthday post — pin to top of the seen-posts section"
 """
+
+
+# Project-name aliases for query mode: the colloquial term the team uses in Discord
+# ("DMs", "messaging") -> the CANONICAL Linear project name. Used by the query engine's
+# project tools (list_projects/get_project/...) to resolve a spoken feature name to a
+# real project when a plain fuzzy match wouldn't get there (e.g. "DMs" would never
+# substring-match "DMs & Group Chat (v1)" on its own).
+#
+# Keys are lower-cased; the resolver lower-cases the user's term before looking it up.
+# Values are the canonical project name AS IT APPEARS IN LINEAR (also matched
+# case-insensitively) — keep them in sync with the live project list. Fuzzy/substring
+# matching still runs for terms NOT in this map, so this only needs the awkward cases.
+PROJECT_ALIASES = {
+    # DMs & Group Chat (v1) — the launch everyone refers to by shorthand.
+    "dms": "DMs & Group Chat (v1)",
+    "dm": "DMs & Group Chat (v1)",
+    "direct message": "DMs & Group Chat (v1)",
+    "direct messages": "DMs & Group Chat (v1)",
+    "direct messaging": "DMs & Group Chat (v1)",
+    "messaging": "DMs & Group Chat (v1)",
+    "messages": "DMs & Group Chat (v1)",
+    "group chat": "DMs & Group Chat (v1)",
+    "group chats": "DMs & Group Chat (v1)",
+    "chat": "DMs & Group Chat (v1)",
+    # Other frequently-shorthanded projects.
+    "kyc": "KYC + Aadhaar Onboarding",
+    "aadhaar": "KYC + Aadhaar Onboarding",
+    "wallet": "Stripe Wallet + Campaign Controls",
+    "stripe": "Stripe Wallet + Campaign Controls",
+    "pulse": "Pulse — V2",
+    "retargeting": "Retargeting in Create Campaigns",
+    "attention score": "Attention Score Notification",
+}
+
